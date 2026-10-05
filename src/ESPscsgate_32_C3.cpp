@@ -1,6 +1,6 @@
 //---------------------------------------------------------------------------------------------------------
 #define _FW_NAME     "SCSGATE_32"
-#define _FW_VERSION  "VER_8.008 "
+#define _FW_VERSION  "VER_8.009 "
 #define _ESP_CORE    "esp32-2.5.2"
 // ========================================================================================================
 
@@ -958,7 +958,8 @@ AsyncWebServer a_server(http_port);
 HTTPClient httpClient;
 
 // Interfaccia HTML con layout a due colonne (Split Screen)
-const char index_html[] PROGMEM = R"rawliteral(
+
+const char index_html_LOG[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
@@ -980,8 +981,33 @@ const char index_html[] PROGMEM = R"rawliteral(
             font-family: 'Courier New', Courier, monospace; overflow-y: auto; display: flex; flex-direction: column; 
         }
 //        .log-entry { margin: 4px 0; font-size: 14px; line-height: 1.4; color: #80ea6e; }
-        .log-entry { margin: 4px 0; line-height: 1.4; font-size: 14px; }
-        .info { color: #80ea6e; }
+//        .log-entry { margin: 4px 0; line-height: 1.4; font-size: 14px; }
+        .log-entry { 
+            margin: 1px 0;         /* Ridotto a solo 1px sopra/sotto per avvicinare le righe */
+            line-height: 1.15;     /* Interlinea super compatta (115% invece di 140%) */
+            font-size: 13px;       /* Leggermente più piccolo per stile console reale */
+            white-space: pre-wrap; /* Mantiene la formattazione esatta dei caratteri a spaziatura fissa */
+            word-break: break-all; /* 💡 FORZA l'andata a capo automatica anche a metà parola se finisce lo spazio */
+        }
+Usa il codice con cautela.
+Un controllo extra se usi tabelle o flexbox
+Se la proprietà sopra non dovesse bastare, controlla il contenitore padre #log-container. Se nel C3 non ha una larghezza massima bloccata o se è dentro un layout flex che può espandersi all'infinito, il browser allargherà il box anziché mandare a capo il testo. Per blindarlo, assicurati che il contenitore dei log abbia la larghezza minima/massima vincolata al 100% dello spazio della colonna:
+css
+#log-container {
+    /* ... il tuo stile attuale ... */
+    width: 100%;
+    max-width: 100%;
+    overflow-x: hidden; /* Impedisce la comparsa della barra orizzontale spingendo il testo a capo */
+}
+Usa il codice con cautela.
+Applicando word-break: break-all;, risolverai istantaneamente il problema sul C3, uniformando il comportamento visivo dei log a quello dell'S3.
+Se vuoi, fammi sapere:
+• Se i dati inviati dal C3 sono stringhe continue senza spazi (es. dump esadecimali).
+• Se l'aggiunta di word-break ha risolto il problema del wrap orizzontale sul C3.
+• Se hai bisogno di allineare anche la logica del comando *reset su Arduino per il C3 usando ESP.restart().
+Le risposte dell'AI potrebbero contenere errori. Scopri di più
+        }
+		.info { color: #80ea6e; }
         .warn { color: #ffb300; }
         .error { color: #ff5252; }
         
@@ -1006,62 +1032,80 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div class="log-entry" style="color: #888;">In attesa di log SCS...</div>
             </div>
         </div>
-        
-        <!-- COLONNA DESTRA: INPUT -->
-        <div class="col-right">
-            <div class="card-input">
-                <h3>Invia Comando</h3>
-                <input type="text" id="comando-input" placeholder="Scrivi qui il comando..." maxlength="50">
-                <button onclick="inviaDati()">Esegui</button>
-                <div id="status-msg"></div>
-            </div>
-        </div>
-    </div>
+
+		<!-- COLONNA DESTRA: INPUT -->
+		<div class="col-right">
+			<div class="card-input">
+				<h3>Invia Comando</h3>
+				<!-- Avvolto in un form per gestire l'Invio nativamente -->
+				<form onsubmit="event.preventDefault(); inviaDati();">
+					<input type="text" id="comando-input" placeholder="Scrivi qui il comando..." maxlength="50">
+					<!-- Il bottone diventa di tipo submit -->
+					<button type="submit">Esegui</button>
+				</form>
+				<div id="status-msg"></div>
+			</div>
+		</div>
+
+	</div>
 
     <script>
         // Gestione SSE (Log a sinistra)
         if (!!window.EventSource) {
             var source = new EventSource('/events');
             var container = document.getElementById('log-container');
-
             source.addEventListener('log', function(e) {
+                // [cls]: Se arriva il comando di pulizia, svuota lo schermo ed esce
+                if (e.data.trim() === '[cls]') {
+//                    container.innerHTML = '<div class="log-entry" style="color: #888;">In attesa di log SCS...</div>';
+                    container.innerHTML = '<div class="log-entry" style="color: #888;"</div>';
+//                    return; // Interrompe l'esecuzione qui
+                }
                 if (container.children.length === 1 && container.children[0].style.color === 'rgb(136, 136, 136)') {
                     container.innerHTML = '';
                 }
-                var entry = document.createElement('div');
-                entry.className = 'log-entry';
+                // Verifica se la stringa termina con il marcatore [k]
+//                var continuaRiga = e.data.endsWith('[k]');
+                var continuaRiga = e.data.endsWith('.k');
+//                var datiPuliti = continuaRiga ? e.data.slice(0, -3) : e.data; // Rimuove "[k]" se presente
+                var datiPuliti = e.data; // Rimuove "[k]" se presente
 
-  // Formatta il testo (es. colora in base al tipo di log)
-                if (e.data.includes(' TX:')) entry.classList.add('error');
-                else if (e.data.includes('[CMD]')) entry.classList.add('warn');
-                else entry.classList.add('info');
+                // Ripristina i veri a capo convertendo "\\n" in "\n"
+                var logFormattato = datiPuliti.replace(/\\n/g, '\n').replace(/\n/g, '<br>');
 
-  // Ripristina i veri a capo convertendo "\\n" in "\n"
-                var logFormattato = e.data.replace(/\\n/g, '\n');
+                // Se dobbiamo continuare la riga precedente E esiste già almeno un elemento nel log
+                if (continuaRiga && container.lastElementChild) {
+                    // Appende il testo direttamente dentro l'ultimo div esistente
+                    container.lastElementChild.innerHTML += logFormattato;
+                } else {
+                    // Altrimenti crea una NUOVA riga (comportamento standard)
+                    var entry = document.createElement('div');
+                    entry.className = 'log-entry';
 
-//                entry.innerHTML = e.data;   
-                entry.innerHTML = logFormattato.replace(/\n/g, '<br>'); // Sostituisce i veri a capo con <br> per HTML
-                container.appendChild(entry); 
+                    // Formatta il testo (es. colora in base al tipo di log)
+                    if (e.data.includes(' TX:')) entry.classList.add('error');
+                    else if (e.data.includes('[CMD]')) entry.classList.add('warn');
+                    else entry.classList.add('info');
 
-//                newLog.innerHTML = `<span>[${new Date().toLocaleTimeString()}]</span> ${e.data}`; // <----------------------------
-//                container.appendChild(newLog); // <----------------------------
-
-                if (container.children.length > 20) {
+                    entry.innerHTML = logFormattato;
+                    container.appendChild(entry);
+                }
+                // Controllo del buffer massimo a 34 righe
+                if (container.children.length > 34) {
                     container.removeChild(container.firstChild);
                 }
+                // Forza lo scroll del container sempre sull'ultima riga visiva,
+                // risolvendo il problema delle righe lunghe che spingono il testo verso il basso
+                container.scrollTop = container.scrollHeight;
             }, false);
-
             source.addEventListener('open', function(e) {
                 console.log('Flusso log aperto.');
             }, false);
-
             source.addEventListener('chiudi_connessione', function(e) {
                 container.innerHTML = 'Connessione chiusa.';
                 console.log("Il server mi ha chiesto di chiudere.");
                 source.close(); // Questo blocca definitivamente i tentativi di riconnessione automatica del browser
             });
-
-
         }
 
         // Invio Input asincrono (Destra) senza ricaricare la pagina
@@ -1100,7 +1144,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
-
 
 
 bool testWifi(void);
@@ -3577,7 +3620,7 @@ void createWebServer(int webtype)
 // =============================================================================================
     // Rotta Principale: serve la pagina HTML di controllo
     a_server.on("/sselog", HTTP_GET, [](AsyncWebServerRequest *request){
-        request->send(200, "text/html", index_html);
+        request->send(200, "text/html", index_html_LOG);
     });
 
     // Registrazione del gestore SSE sul server
@@ -3609,6 +3652,8 @@ void createWebServer(int webtype)
       content += "<li>/mqttdevices (mqtt devices discover)</li>";
       content += "<li>/devicename (mqtt devices names)</li>";
       content += "<li>/sselog     (SCS LOG)</li>";
+      content += "<li>/devices    (CENSIMENTO)</li>";
+      content += "<li>/sseha      (DOMOTIC)</li>";
       content += "</ol>";
       content += "</form></html>";
       request->send(200, "text/html", content);
