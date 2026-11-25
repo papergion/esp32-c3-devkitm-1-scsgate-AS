@@ -1,14 +1,34 @@
 //---------------------------------------------------------------------------------------------------------
 #define _FW_NAME     "SCSGATE_32"
-#define _FW_VERSION  "VER_8.009 "
+#define _FW_VERSION  "VER_9.002 "
 #define _ESP_CORE    "esp32-2.5.2"
 // ========================================================================================================
 
 /*
 da sviluppare:
 - gestione dispositivi generici, allarme, termostato, ... in sse HA
-- censimento automatico dispositivi
-- trattamento % dimmer 'm'
+
+test da rifare:
+- scrittura messaggi scs -> ok
+- aggiornamento sseha    -> luci ok, dimmer ok, termo ok, tappa KO
+- scrittura mqtt         -> OK
+- lettura mqtt           -> OK
+- censimento automatico dispositivi (cmd auto)  - mettere 0 in valore_max -> ok
+- censimento automatico IN MQTT -> ok
+- read/write da vb6   -> ok
+- aggiornamento dispositivi (tap) nel PIC -> ok
+- gestione tapparelle a percentuale -> ok
+- sistemare /status -> ok
+- test funzioni /gate:ok  /request: -> ok
+- gestione fauxmo alexa : -> ok
+- gestione dispositivi generici
+- layout /sselog    -> ok
+- layout vari       -> ok
+
+
+
+- manuale nuovo -> ok
+
 */
 
 // ========================================================================================================
@@ -29,20 +49,24 @@ da sviluppare:
 
 #define JMP 7
 #define BLINKLED     
-#define LOWPOWER
 
 const int pinLed = 8;
 
 #define SCS
 
-//#define DEBUG_EVENTITY
+///#define DEBUG_EVENTITY
+///#define TRACE_SSE
+
+
+
 //#define DEBUG
 //#define VERBOSE
 
 #define MY_DOMOTIC
 #define MY_TABELLA
+#define TERMO_NEW
 
-// #define FFS
+#define FFS
 #define PIC_REQ 0xA7
 //----------------------------------------------------------------------------------
 //        ---- attenzione - porta http: 8080 <--se alexaParam=y--------------
@@ -141,6 +165,7 @@ const int pinLed = 8;
 */
 
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 //#include <AsyncJson.h>
@@ -157,6 +182,10 @@ const int pinLed = 8;
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 
+#include "esp_ota_ops.h"
+#include "esp_image_format.h"
+#include "esp_app_format.h"
+
 #ifdef FFS
   #define CONFIG_LITTLEFS_FOR_IDF_3_2
   #define CONFIG_LITTLEFS_SPIFFS_COMPAT 1
@@ -172,360 +201,16 @@ char  flagRefreshDevices =  0;
 
 AsyncEventSource events("/events");
 
-#define MY_ENTITA 64
-
-#ifdef MY_DOMOTIC
-// devices type:
-// 0x01:1-switch
-// 0x03:3-dimmer scs
-// 0x04:4-dimmer on/off	        0x15:21-dimmer up/dw		   
-// 0x08:8-tapparella stop       0x09:9-tapparella pct stop   
-// 0x12:18-tapparella up/dwn    0x13:19-tapparella pct up/dwn (knx)
-// 0x0B:11-generic              0x0C:12-generic 
-// 0x0E:14-:allarme             0x0F:15-termostato
-// 0x30-0x37:rele i2c
-// 0x40-0x47:pulsanti i2c
-
-enum TipoEntita { ENTI_INTERRUTTORE, ENTI_SENSORE, ENTI_SLIDER, ENTI_TAPPARELLA, ENTI_TAPPARELLA_PCT };
-
-uint8_t corrispondenza[5] = {1,15,3,8,9};
-
-struct Entita {
-    String id;
-    String nome;
-    TipoEntita tipo;
-    uint8_t pin;    // SCS address
-    String stato;
-    uint8_t valore; 
-};
-
-Entita elencoEntita[MY_ENTITA];
-int numeroEntita = 0;
-
-void aggiungiEntita(String id, String nome, TipoEntita tipo, uint8_t pin, String statoIniziale, uint8_t valore) {
-    if (numeroEntita < MY_ENTITA) {
-//        String statoEffettivo = statoInizialeDefault;
-//        if (tipo == ENTI_INTERRUTTORE || tipo == ENTI_SLIDER || tipo == ENTI_TAPPARELLA) {
-//            statoEffettivo = leggiStatoSalvato(id, statoInizialeDefault);
-//        }
-//        if (pin != -1 && tipo == ENTI_INTERRUTTORE) {
-//            pinMode(pin, OUTPUT);
-//            digitalWrite(pin, statoIniziale == "ON" ? HIGH : LOW);
-//        }
-        elencoEntita[numeroEntita] = {id, nome, tipo, pin, statoIniziale, valore};
-        numeroEntita++;
-    }
-}
-// ----------------------------------------------------------------  
-int cercaEntitaScs(int pin) {
-    for (int i = 0; i < numeroEntita; i++) {
-        if (elencoEntita[i].pin == pin) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-AsyncEventSource eventity("/eventity");
+#define MY_ENTITA 128
+#define MAX_INFO  16
+#define INFO_LEN  18
 
 
+wifi_power_t TxPower = WIFI_POWER_8_5dBm;
+uint8_t  ctrPotenza = 0;
+uint8_t  forcePower = 0;
 
-
-
-
-const char index_html_HA[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="it">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32-C3 JSON Dashboard</title>
-    <style>
-        body { font-family: 'Segoe UI', sans-serif; background: #f4f7f6; color: #333; text-align: center; padding: 20px; }
-        .grid { display: flex; flex-wrap: wrap; justify-content: center; max-width: 1200px; margin: 0 auto; }
-        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 8px rgba(0,0,0,0.05); width: 180px; margin: 10px; text-align: left; }
-        h1 { color: #007bff; }
-        h2 { margin-top: 0; font-size: 1.3em; color: #444; }
-        .status-badge { padding: 4px 10px; border-radius: 20px; font-weight: bold; font-size: 0.85em; float: right; }
-        .ON { background: #d4edda; color: #155724; }
-        .OFF { background: #f8d7da; color: #721c24; }
-        .VAL { background: #e2e3e5; color: #383d41; }
-        .btn { border: none; padding: 10px 0; width: 100%; font-size: 14px; border-radius: 6px; cursor: pointer; transition: 0.2s; font-weight: bold; margin-top: 20px; background: #007bff; color: white; }
-        .btn:hover { background: #0056b3; }
-        .btn-tapp { flex: 1; border: none; padding: 10px 0; font-weight: bold; border-radius: 6px; cursor: pointer; background: #e2e3e5; color: #333; transition: 0.2s; }
-        .active-up { background: #28a745; color: white; }
-        .active-stop { background: #dc3545; color: white; }
-        .active-down { background: #ffc107; color: black; }
-    </style>
-</head>
-<body>
-    <h1>ESP32-C3 Client-Side Dashboard</h1>
-    <div id="dashboardGrid" class="grid">
-        <!-- Le card verranno inserite dinamicamente qui dal ciclo JS -->
-    </div>
-
-<script>
-    let sliderInUso = {};
-
-    async function inizializzaDashboard() {
-        try {
-            const response = await fetch('/api/config');
-            const entitaElenco = await response.json();
-            const grid = document.getElementById('dashboardGrid');
-            
-            entitaElenco.forEach(entita => {
-                const card = document.createElement('div');
-                card.className = 'card';
-                
-                if (entita.tipo === 0) { // ENTI_INTERRUTTORE
-                    card.innerHTML = `
-                        <h2>${entita.nome}</h2>
-                        <p>Stato: <span id="badge_${entita.id}" class="status-badge ${entita.stato}">${entita.stato}</span></p>
-                        <button class="btn" onclick="inviaComando('${entita.id}')">AZIONA</button>
-                    `;
-                } else if (entita.tipo === 1) { // ENTI_SENSORE
-                    card.innerHTML = `
-                        <h2>${entita.nome}</h2>
-                        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 15px;">
-                            <span style="font-size: 2rem; margin-right: 10px;">🌡️</span>
-                            <div style="text-align: right; font-size: 1.6rem; font-weight: bold; color: #007bff;">
-                                <span id="badge_${entita.id}">${entita.stato}</span>°C
-                            </div>
-                        </div>
-                    `;
-                } else if (entita.tipo === 2) { // ENTI_SLIDER
-                    const parti = entita.stato.split('|');
-                    const acceso = parti[0];
-                    const livello = parti[1];
-                    card.innerHTML = `
-                        <h2>${entita.nome}</h2>
-                        <p>Stato: <span id="badge_${entita.id}" class="status-badge ${acceso}">${acceso}</span> (<b id="valore_${entita.id}">${livello}</b>)</p>
-                        <input type="range" min="0" max="100" value="${livello}" class="slider" 
-                            id="slider_${entita.id}" 
-                            oninput="aggiornaSliderLocale('${entita.id}', this.value)" 
-                            onchange="inviaValoreSlider('${entita.id}', this.value)">
-                        <div style="display: flex; gap: 5px; margin-top: 15px;">
-                            <button class="btn" onclick="inviaComando('${entita.id}')">AZIONA</button>
-                        </div>
-                    `;
-                    sliderInUso[entita.id] = false;
-                } else if (entita.tipo === 3) { // ENTI_TAPPARELLA
-                      card.innerHTML = `
-                          <h2>${entita.nome}</h2>
-                          <p>Stato: <b id="testo_${entita.id}">${entita.stato}</b></p>
-                          <div style="display: flex; gap: 5px; margin-top: 15px;">
-                              <button id="btn_UP_${entita.id}" class="btn-tapp" onclick="inviaComandoTapparella('${entita.id}', 'SALITA')">▲ SU</button>
-                              <button id="btn_STOP_${entita.id}" class="btn-tapp" onclick="inviaComandoTapparella('${entita.id}', 'STOP')">■ STOP</button>
-                              <button id="btn_DOWN_${entita.id}" class="btn-tapp" onclick="inviaComandoTapparella('${entita.id}', 'DISCESA')">▼ GIÙ</button>
-                          </div>
-                      `;
-                } else if (entita.tipo === 4) { // ENTI_TAPPARELLA_PCT
-                      const partiTapp = entita.stato.split('|');
-                      const pct = partiTapp[0];
-                      const direzione = partiTapp[1];
-                      card.innerHTML = `
-                          <h2>${entita.nome}</h2>
-                          <p>Posizione: <b id="testo_pct_${entita.id}">${pct}</b>% (<span id="testo_dir_${entita.id}">${direzione}</span>)</p>
-                          <input type="range" min="0" max="100" value="${pct}" class="slider" 
-                              id="slider_pct_${entita.id}" 
-                              oninput="sliderInUso['${entita.id}'] = true; document.getElementById('testo_pct_${entita.id}').innerText = this.value" 
-                              onchange="inviaTargetTapparella('${entita.id}', this.value)">
-                          <div style="display: flex; gap: 5px; margin-top: 15px;">
-                              <button id="btn_UP_${entita.id}" class="btn-tapp" onclick="inviaTargetTapparella('${entita.id}', '100')">▲ APRI</button>
-                              <button id="btn_STOP_${entita.id}" class="btn-tapp" onclick="inviaTargetTapparella('${entita.id}', 'STOP')">■ STOP</button>
-                              <button id="btn_DOWN_${entita.id}" class="btn-tapp" onclick="inviaTargetTapparella('${entita.id}', '0')">▼ CHIUDI</button>
-                          </div>
-                      `;
-                      sliderInUso[entita.id] = false;
-                      setTimeout(function() { aggiornaGraficaTapparellaPct(entita.id, pct, direzione); }, 10);
-                }
-                grid.appendChild(card);
-                connettiSSE(entita.id, entita.tipo);
-                if(entita.tipo === 3) aggiornaGraficaTapparella(entita.id, entita.stato);
-            });
-        } catch (error) {
-            console.error("Errore nel caricamento della configurazione JSON:", error);
-        }
-    }
-
-    function inviaComando(idEntita) {
-        const badge = document.getElementById('badge_' + idEntita);
-        if (badge) {
-            const nuovoStato = (badge.innerText === 'ON') ? 'OFF' : 'ON';
-            badge.innerText = nuovoStato;
-            badge.className = 'status-badge ' + nuovoStato;
-        }
-        fetch('/api/toggle?id=' + idEntita, { method: 'POST' })
-        .catch(err => console.error("Errore comando:", err));
-    }
-
-    function aggiornaSliderLocale(idEntita, valore) {
-        sliderInUso[idEntita] = true;
-        document.getElementById('valore_' + idEntita).innerText = valore;
-    }
-
-    function inviaValoreSlider(idEntita, valore) {
-        fetch('/api/set?id=' + idEntita + '&val=' + valore, { method: 'POST' })
-        .then(function() {
-            setTimeout(function() { sliderInUso[idEntita] = false; }, 300);
-        })
-        .catch(err => {
-            console.error(err);
-            sliderInUso[idEntita] = false;
-        });
-    }
-
-    function inviaComandoTapparella(idEntita, comando) {
-        fetch('/api/tapparella?id=' + idEntita + '&cmd=' + comando, { method: 'POST' })
-        .catch(err => console.error("Errore tapparella:", err));
-    }
-
-    function aggiornaGraficaTapparella(id, stato) {
-        const btnUp = document.getElementById('btn_UP_' + id);
-        const btnStop = document.getElementById('btn_STOP_' + id);
-        const btnDown = document.getElementById('btn_DOWN_' + id);
-        const testo = document.getElementById('testo_' + id);
-        
-        if(!btnUp || !btnStop || !btnDown) return;
-        
-        testo.innerText = stato;
-        btnUp.className = "btn-tapp";
-        btnStop.className = "btn-tapp";
-        btnDown.className = "btn-tapp";
-        
-        if (stato === "SALITA") btnUp.classList.add("active-up");
-        else if (stato === "STOP") btnStop.classList.add("active-stop");
-        else if (stato === "DISCESA") btnDown.classList.add("active-down");
-    }
-
-function inviaTargetTapparella(idEntita, target) {
-    fetch('/api/tapparella_pct?id=' + idEntita + '&target=' + target, { method: 'POST' })
-    .catch(err => console.error(err));
-}
-
-function aggiornaGraficaTapparellaPct(id, pct, direzione) {
-    const inputSlider = document.getElementById('slider_pct_' + id);
-    const testoPct = document.getElementById('testo_pct_' + id);
-    const testoDir = document.getElementById('testo_dir_' + id);
-    const btnUp = document.getElementById('btn_UP_' + id);
-    const btnStop = document.getElementById('btn_STOP_' + id);
-    const btnDown = document.getElementById('btn_DOWN_' + id);
-    
-    if (!inputSlider) return;
-
-    if (!sliderInUso[id]) {
-        inputSlider.value = pct;
-        testoPct.innerText = pct;
-    }
-    testoDir.innerText = direzione;
-    btnUp.className = "btn-tapp";
-    btnStop.className = "btn-tapp";
-    btnDown.className = "btn-tapp";
-
-    if (direzione === "SALITA") btnUp.classList.add("active-up");
-    else if (direzione === "STOP") btnStop.classList.add("active-stop");
-    else if (direzione === "DISCESA") btnDown.classList.add("active-down");
-}
-
-function connettiSSE(idEntita, tipoEntita) {
-        if (!window.sseInizializzato) {
-            window.source = new EventSource('/eventity');
-            window.sseInizializzato = true;
-        }
-        
-        window.source.addEventListener(idEntita, function(e) {
-            if (tipoEntita === 2 && sliderInUso[idEntita]) return; 
-
-            if (tipoEntita === 0) {
-                const badge = document.getElementById('badge_' + idEntita);
-                if (badge) {
-                    badge.innerText = e.data;
-                    if (e.data === 'ON') badge.className = 'status-badge ON';
-                    else if (e.data === 'OFF') badge.className = 'status-badge OFF';
-                    else badge.className = 'status-badge VAL';
-                }
-            } else if (tipoEntita === 1) {
-                const badge = document.getElementById('badge_' + idEntita);
-                if (badge) {
-                    badge.innerText = e.data.replace('°C', '').trim();
-                }
-            } else if (tipoEntita === 2) {
-                const badge = document.getElementById('badge_' + idEntita);
-                const testoValore = document.getElementById('valore_' + idEntita);
-                const inputSlider = document.getElementById('slider_' + idEntita);
-                
-                if (e.data.includes('|')) {
-                    const partiRemote = e.data.split('|');
-                    const acceso = partiRemote[0];
-                    const livello = partiRemote[1];
-                    if (badge) {
-                        badge.innerText = acceso;
-                        badge.className = 'status-badge ' + acceso;
-                    }
-                    if (testoValore) testoValore.innerText = livello;
-                    if (inputSlider) inputSlider.value = livello;
-                } else {
-                    if (testoValore) testoValore.innerText = e.data;
-                    if (inputSlider) inputSlider.value = e.data;
-                }
-            }
-            else if (tipoEntita === 3) {
-                aggiornaGraficaTapparella(idEntita, e.data);
-            }
-            else if (tipoEntita === 4) {
-                const partiTappRemote = e.data.split('|');
-                const stringPct = partiTappRemote[0];
-                const stringDirezione = partiTappRemote[1];
-                
-                if(stringDirezione === "STOP") {
-                    sliderInUso[idEntita] = false;
-                }
-                
-                aggiornaGraficaTapparellaPct(idEntita, stringPct, stringDirezione);
-            }
-        });
-    }
-
-    window.onload = inizializzaDashboard;
-</script>
-</body>
-</html>
-)rawliteral";
-
-
-
-// Funzione C++ per convertire l'array di strutture in un formato stringa JSON valido
-String generaConfigurazioneJSON() {
-
-    String json = "[";
-    for (int i = 0; i < numeroEntita; i++) {
-        json += "{";
-        json += "\"id\":\"" + elencoEntita[i].id + "\",";
-        json += "\"nome\":\"" + elencoEntita[i].nome + "\",";
-        json += "\"tipo\":" + String(elencoEntita[i].tipo) + ",";
-        if (elencoEntita[i].tipo == ENTI_TAPPARELLA_PCT) 
-          json += "\"stato\":\"" + String(elencoEntita[i].valore) + "|" + elencoEntita[i].stato + "\"";
-        else
-        if (elencoEntita[i].tipo == ENTI_SLIDER)
-          json += "\"stato\":\"" + String(elencoEntita[i].stato) + "|" + elencoEntita[i].valore + "\"";
-        else
-          json += "\"stato\":\"" + elencoEntita[i].stato + "\"";
-        json += "}";
-        if (i < numeroEntita - 1) json += ",";
-    }
-    json += "]";
-#ifdef DEBUG_EVENTITY
-  events.send(json, "log", millis());
-#endif
-    return json;
-}
-
-
-#endif
-
-
-
-#ifdef MY_TABELLA
+uint16_t delay_internal = 1000;
 
 // =======================================================================================================================
 // Struttura dati per il byte di aggiornamento
@@ -546,227 +231,123 @@ String generaConfigurazioneJSON() {
   } AGG_VAL;
 
 
-// =======================================================================================================================
+// ==========================================================================================================================
+// ==========================================================================================================================
+// ==========================================================================================================================
+// Struttura fissa per il singolo dispositivo SCS (totale 32 byte a record)
+struct DispositivoSCS {
+    uint8_t  id;               // -1 se lo slot è libero, altrimenti da 0 a 128
+    char address[3];       // es. "01" o "FF"
+    uint8_t  tipo_codice;  // "LUC", "DIM", "TAP", etc. -  Memorizzato come numero (1, 3, 8, 11, 14, 15, 16)
+	char descrizione[25];  // Massimo 24 caratteri + terminatore
+    char valore_max[4];    // es. "100" o "ON"
+    char alexa_id;         // ID POINTER PER FAUXMO
 
-
-// Struttura dati per il singolo elemento della lista con i limiti richiesti
-struct Elemento {
-    char address[3];     // 2 caratteri + terminatore null
-    char tipo[4];        // 3 caratteri + terminatore null
-    char descrizione[21];// 20 caratteri + terminatore null
-    char valore[4];      // 3 caratteri + terminatore null
-    bool valido = false; // Flag per verificare se lo slot è occupato    
-    AGG_VAL bits;        // in OR: 0x01=riga cancellata   0x02=riga nuova                0x10=chiave cambiata 
-                         //        0x20=tipo aggiornato   0x40=descrizione aggiornata    0x80=valore cambiato   
+    char valore_corrente[6];       // Memorizza i valori temporanei (es. "100", "22.5") per tapparelle_pct e dimmer
+    int8_t ptr_info;       // pointer a cardinfo (-1 se manca)
+    char stato[12];        // Memorizza lo stato corrente (es. "ON", "OFF", "STOP")  
+	uint8_t valido = 0;     // slot valido (0) o occupato (1) o temporaneo (2)
+    AGG_VAL bits;          // in OR: 0x01=riga cancellata   0x02=riga nuova                0x10=chiave cambiata 
+                           //        0x20=tipo aggiornato   0x40=descrizione aggiornata    0x80=valore cambiato   
 };
 
-Elemento lista[MY_ENTITA];
-int conteggioElementi = 0;
-bool tapparellePercentuale = false; // Stato memorizzato in RAM
+// Struttura globale compressa per la Flash (circa 2.1 KB totali)
+struct ConfigurazioneGlobale {
+    uint8_t tapparelle_percentuale; // 0 = standard, 1 = percentuale
+    DispositivoSCS elenco[MY_ENTITA];
+//	DispositivoInfo cardinfo[MAX_INFO];
+};
 
-// Pagina HTML + JavaScript integrata
-const char index_html_TAB[] PROGMEM = R"rawhtml(
-<!DOCTYPE html>
-<html lang="it">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dispositivi SCS</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f9; color: #333; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; background: white; }
-        th { border: 1px solid #ccc; padding: 6px 10px; text-align: left; background-color: #007bff; color: white; }
-        td { border: 1px solid #ccc; padding: 4px 10px; text-align: left; }
-        
-        form { background: white; padding: 15px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-        input, select, button { padding: 6px; border: 1px solid #ccc; border-radius: 4px; background: white; }
-        
-        .divider { width: 1px; height: 26px; background-color: #ccc; margin: 0 5px; }
-        
-        .config-inline { display: flex; align-items: center; gap: 6px; font-weight: bold; font-size: 14px; }
-        .config-inline input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; margin: 0; }
-        
-        button { background-color: #28a745; color: white; cursor: pointer; border: none; padding: 5px 12px; }
-        button:hover { background-color: #218838; }
-        
-        .btn-refresh { background-color: #17a2b8; font-weight: bold; }
-        .btn-refresh:hover { background-color: #138496; }
-        .btn-edit { background-color: #ffc107; color: #212529; }
-        .btn-edit:hover { background-color: #e0a800; }
-        .btn-del { background-color: #dc3545; }
-        .btn-del:hover { background-color: #c82333; }
-        .btn-cancel { background-color: #6c757d; }
-        .btn-cancel:hover { background-color: #5a6268; }
-    </style>
-</head>
-<body>
-    <h2>Dispositivi SCS (<span id="count">0</span>/50)</h2>
-    
-    <form action="/add" method="POST" id="main-form">
-        <input type="hidden" name="id" id="form-id" value="-1">
-        <input type="text" name="address" id="form-address" placeholder="Addr (2)" maxlength="2" required style="width: 60px;" pattern="^[0-9A-Fa-f]{2}$" title="Inserire un valore esadecimale di 2 cifre (es. 01 o FF)" oninput="this.value = this.value.toUpperCase();">
-        
-        <select name="tipo" id="form-tipo" style="width: 80px;" required>
-            <option value="LUC">LUC</option>
-            <option value="DIM">DIM</option>
-            <option value="TAP">TAP</option>
-            <option value="GEN">GEN</option>
-            <option value="ALA">ALA</option>
-            <option value="TER">TER</option>
-        </select>
-        
-        <input type="text" name="desc" id="form-desc" placeholder="Descrizione (20)" maxlength="20" required style="width: 180px;">
-        <input type="text" name="valore" id="form-valore" placeholder="Val (3)" maxlength="3" required style="width: 60px;">
-        
-        <button type="submit" id="btn-submit">Aggiungi</button>
-        <button type="button" id="btn-cancel" class="btn-cancel" style="display:none;" onclick="annullaModifica()">Annulla</button>
-        
-        <div class="divider"></div>
-        
-        <div class="config-inline">
-            <input type="checkbox" id="chk-tapparelle">
-            <label for="chk-tapparelle">Tapparelle a percentuale</label>
-        </div>
-        
-        <button type="button" class="btn-refresh" onclick="salvaInEEPROM()">Aggiorna</button>
-    </form>
+// 🟢 Questa è l'istanza in RAM che viene modificata in tempo reale dalle API
+static ConfigurazioneGlobale sistema_scs;
 
-    <table>
-        <thead>
-            <tr>
-                <th>Address</th>
-                <th>Tipo</th>
-                <th>Descrizione</th>
-                <th>Valore</th>
-                <th>Azioni</th>
-            </tr>
-        </thead>
-        <tbody id="tabella-dati">
-            <!-- Dati inseriti dinamicamente via script -->
-        </tbody>
-    </table>
+struct IndiceSCS {
+    uint8_t pointer;  // Puntatore all'indice dell'array 'sistema_scs.elenco' (0-63). 0xFF = non censito
+};
+// 🟢 Tabella indice globale ad accesso immediato (O(1)) per i 256 indirizzi possibili (0x00 - 0xFF)
+static IndiceSCS tabella_indice[256];
+// ==========================================================================================================================
+// ==========================================================================================================================
+// ==========================================================================================================================
 
-    <script>
-        window.addEventListener('DOMContentLoaded', () => {
-            caricaConfig();
-            caricaDati(); 
-        });
 
-        function caricaDati() {
-            fetch('/data')
-                .then(response => response.text())
-                .then(txt => {
-                    const tbody = document.getElementById('tabella-dati');
-                    tbody.innerHTML = '';
-                    if(!txt.trim()) {
-                        document.getElementById('count').innerText = '0';
-                        return;
-                    }
-                    const linee = txt.split('\n');
-                    let count = 0;
-                    
-                    linee.forEach(linea => {
-                        if(!linea.trim()) return;
-                        const token = linea.split(',');
-                        const id = token[0];
-                        const addr = token[1];
-                        const tipo = token[2];
-                        const desc = token[3];
-                        const val = token[4];
-                        
-                        const row = document.createElement('tr');
-                        row.innerHTML = `
-                            <td>${addr}</td>
-                            <td>${tipo}</td>
-                            <td>${desc}</td>
-                            <td>${val}</td>
-                            <td>
-                                <button type="button" class="btn-edit" onclick="preparaModifica(${id}, '${addr}', '${tipo}', '${desc}', '${val}')">Modifica</button>
-                                <button type="button" class="btn-del" onclick="elimina(${id})">Elimina</button>
-                            </td>
-                        `;
-                        tbody.appendChild(row);
-                        count++;
-                    });
-                    document.getElementById('count').innerText = count;
-                });
-        }
 
-        function caricaConfig() {
-            fetch('/get-config')
-                .then(response => response.text())
-                .then(stato => {
-                    document.getElementById('chk-tapparelle').checked = (stato.trim() === '1');
-                });
-        }
 
-        function salvaInEEPROM() {
-            const btn = document.querySelector('.btn-refresh');
-            const testoOriginale = btn.innerText;
-            const chkTapparelle = document.getElementById('chk-tapparelle').checked ? '1' : '0';
-            
-            btn.innerText = 'Memorizzazione...';
-            btn.disabled = true;
+#ifdef MY_DOMOTIC
+// devices type:
+// 0x01:1-switch
+// 0x03:3-dimmer scs
+// 0x04:4-dimmer on/off	        0x15:21-dimmer up/dw		   
+// 0x08:8-tapparella stop       0x09:9-tapparella pct stop   
+// 0x12:18-tapparella up/dwn    0x13:19-tapparella pct up/dwn (knx)
+// 0x0B:11-generic              0x0C:12-generic 
+// 0x0E:14-:allarme             0x0F:15-termostato
+// 0x30-0x37:rele i2c
+// 0x40-0x47:pulsanti i2c
 
-            fetch(`/refresh?tapparelle=${chkTapparelle}`, { method: 'POST' })
-                .then(response => response.text())
-                .then(risposta => {
-                    if(risposta.trim() === "OK") {
-                        alert('Logica di memorizzazione eseguita con successo!');
-                    } else {
-                        alert('Errore restituito dall\'ESP32.');
-                    }
-                    btn.innerText = testoOriginale;
-                    btn.disabled = false;
-                })
-                .catch(err => {
-                    alert('Errore di connessione con l\'ESP32');
-                    btn.innerText = testoOriginale;
-                    btn.disabled = false;
-                });
-        }
+#define LUCE			1
+#define DIMMER			3
+#define TAPPARELLA		8
+#define GENERICO		11
+#define ALLARME 		14
+#define TERMOSTATO		15
+#define TAPPARELLA_PCT  9
+#define INFO            20
+#define LOCALE			51
 
-        document.getElementById('main-form').addEventListener('submit', function(e) {
-            const addrVal = document.getElementById('form-address').value;
-            if (addrVal === '00') {
-                alert('L\'indirizzo 00 non è valido. Inserire un valore da 01 a FF.');
-                e.preventDefault();
-            }
-        });
+enum TipoEntita { ENTI_INTERRUTTORE, ENTI_SENSORE, ENTI_SLIDER, ENTI_TAPPARELLA, ENTI_TAPPARELLA_PCT, ENTI_INFO };
 
-        function preparaModifica(id, addr, tipo, desc, val) {
-            document.getElementById('form-id').value = id;
-            document.getElementById('form-address').value = addr;
-            document.getElementById('form-tipo').value = tipo;
-            document.getElementById('form-desc').value = desc;
-            document.getElementById('form-valore').value = val;
-            
-            document.getElementById('btn-submit').innerText = 'Salva';
-            document.getElementById('btn-submit').style.backgroundColor = '#007bff';
-            document.getElementById('btn-cancel').style.display = 'inline-block';
-            window.scrollTo(0, 0);
-        }
+// uint8_t corrispondenza[5] = {1,15,3,8,9};
+uint8_t corrispondenza[6] = {LUCE,TERMOSTATO,DIMMER,TAPPARELLA,TAPPARELLA_PCT,GENERICO};
 
-        function annullaModifica() {
-            document.getElementById('form-id').value = '-1';
-            document.getElementById('main-form').reset();
-            document.getElementById('btn-submit').innerText = 'Aggiungi';
-            document.getElementById('btn-submit').style.backgroundColor = '#28a745';
-            document.getElementById('btn-cancel').style.display = 'none';
-        }
+int8_t hwType_to_tipo(int8_t hwtype)
+{
+	if ((hwtype >= 0) &&  (hwtype <= ENTI_INFO))
+		return corrispondenza[hwtype];
+	else
+		return -1;
+}
 
-        function elimina(id) {
-            if(confirm('Eliminare questo elemento?')) {
-                fetch(`/delete?id=${id}`, { method: 'POST' })
-                    .then(() => caricaDati());
-            }
-        }
-    </script>
-</body>
-</html>
-)rawhtml";
+int8_t tipo_to_hwType(uint8_t tipo)
+{
+	int8_t hwtype = -1;
+	switch (tipo)
+	{
+	case LUCE: hwtype = ENTI_INTERRUTTORE; break;
+	case TERMOSTATO: hwtype = ENTI_SENSORE; break;
+	case DIMMER: hwtype = ENTI_SLIDER; break;
+	case TAPPARELLA: hwtype = ENTI_TAPPARELLA; break;
+	case TAPPARELLA_PCT: hwtype = ENTI_TAPPARELLA_PCT; break;
+	case GENERICO: hwtype = ENTI_INFO; break;
+	case 0: hwtype = ENTI_INFO; break;
+	}
+	return hwtype;
+}
+
+
+// Struttura fissa per info del singolo dispositivo SCS 
+struct DispositivoInfo {
+    int id;              // -1 se lo slot è libero, altrimenti puntatore a sistema_scs.elenco[] (indice)
+    char info_0[18];     // Memorizza la nota_1 stato corrente  
+    char info_1[18];     // Memorizza la nota_1 stato corrente  
+    char info_2[18];     // Memorizza la nota_2 stato corrente  
+    char info_3[18];     // Memorizza la nota_3 stato corrente  
+    char info_4[18];     // Memorizza la nota_4 stato corrente  
+};
+DispositivoInfo cardinfo[MAX_INFO];
+int numeroInfo = 0;
+
+bool autocensimento = false;
+
+// ----------------------------------------------------------------  
+
+AsyncEventSource eventity("/eventity");
 
 #endif
+
+#include "pagine_web.h"
+
+// =======================================================================================================================
 
 #include <EEPROM.h>
 
@@ -791,8 +372,6 @@ const char index_html_TAB[] PROGMEM = R"rawhtml(
 #define HTTP_PORT 80
 unsigned int http_port = 80;
 // =======================================================================================================================
-#define DEV_NR            128 // numero massimo di devices - da 00 a A8 per scs
-// =======================================================================================================================
 #define _MODO "SCS"
 #define _modo "scs"
 #define ID_MY "interfaccia scs"
@@ -807,13 +386,13 @@ unsigned int http_port = 80;
 #define SUBSCRIBE2 MYPFX "/+/setlevel/+"
 #define SUBSCRIBE3 MYPFX "/+/setposition/+"
 
-#define NEW_SWITCH_TOPIC "homeassistant/switch/";
-#define NEW_LIGHT_TOPIC  "homeassistant/light/";
-#define NEW_COVER_TOPIC  "homeassistant/cover/";
-#define NEW_CONFIG_TOPIC "/config";
-#define NEW_COVERPCT_TOPIC  "homeassistant/cover/";
-#define NEW_SENSOR_TOPIC  "homeassistant/sensor/";
-#define NEW_GENERIC_TOPIC "homeassistant/generic/";
+#define NEW_SWITCH_TOPIC "homeassistant/switch/"
+#define NEW_LIGHT_TOPIC  "homeassistant/light/"
+#define NEW_COVER_TOPIC  "homeassistant/cover/"
+#define NEW_CONFIG_TOPIC "/config"
+#define NEW_COVERPCT_TOPIC  "homeassistant/cover/"
+#define NEW_SENSOR_TOPIC  "homeassistant/sensor/"
+#define NEW_GENERIC_TOPIC "homeassistant/generic/"
 
 #define NEW_DEVICE_NAME  "{\"name\": \""
 
@@ -872,7 +451,7 @@ unsigned int http_port = 80;
 #define NEW_GENERIC_TO    "\",\"to_topic\": \"" GENERIC_FROM
 
 #define NEW_UNIQUE_ID "\",\"unique_id\": \"scsgate_"
-#define NEW_DEVICE_END   "\"}";
+#define NEW_DEVICE_END   "\"}"
 // =======================================================================================================================
 #include "fauxmoESP.h"
 fauxmoESP fauxmo;
@@ -907,9 +486,11 @@ PubSubClient client(espClient);
 unsigned char mqttopen = 0;
 
 char prevDevice;
+int  prevcount = 0;
 
 char prevAction;
 char internal;
+char prev_internal;
 unsigned char devIx = 0;
 unsigned char devCtr = 0;
 char uartSemaphor = 0;
@@ -953,197 +534,12 @@ int  counter;
 
 char picfwVersion[16];
 
-AsyncWebServer a_server(http_port);
+//AsyncWebServer a_server(http_port);
+AsyncWebServer* a_server_ptr = nullptr;
+#define a_server (*a_server_ptr)
 
 HTTPClient httpClient;
 
-// Interfaccia HTML con layout a due colonne (Split Screen)
-
-const char index_html_LOG[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ESP32-C3 Control Panel</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 0; background-color: #1a1a1a; color: #f0f0f0; height: 100vh; display: flex; flex-direction: column; }
-        h2 { text-align: center; margin: 15px 0; color: #00ff66; }
-        
-        /* Layout principale a due colonne */
-        .container { display: flex; flex: 1; height: calc(100vh - 60px); overflow: hidden; }
-        
-        /* Colonna di Sinistra: Log */
-        .col-left { width: 50%; padding: 20px; border-right: 2px solid #333; display: flex; flex-direction: column; }
-        #log-container { 
-            flex: 1; background-color: #0c0c0c; border: 1px solid #444; border-radius: 6px; padding: 15px; 
-//            font-family: 'Courier New', Courier, monospace; overflow-y: auto; display: flex; flex-direction: column-reverse; 
-            font-family: 'Courier New', Courier, monospace; overflow-y: auto; display: flex; flex-direction: column; 
-        }
-//        .log-entry { margin: 4px 0; font-size: 14px; line-height: 1.4; color: #80ea6e; }
-//        .log-entry { margin: 4px 0; line-height: 1.4; font-size: 14px; }
-        .log-entry { 
-            margin: 1px 0;         /* Ridotto a solo 1px sopra/sotto per avvicinare le righe */
-            line-height: 1.15;     /* Interlinea super compatta (115% invece di 140%) */
-            font-size: 13px;       /* Leggermente più piccolo per stile console reale */
-            white-space: pre-wrap; /* Mantiene la formattazione esatta dei caratteri a spaziatura fissa */
-            word-break: break-all; /* 💡 FORZA l'andata a capo automatica anche a metà parola se finisce lo spazio */
-        }
-Usa il codice con cautela.
-Un controllo extra se usi tabelle o flexbox
-Se la proprietà sopra non dovesse bastare, controlla il contenitore padre #log-container. Se nel C3 non ha una larghezza massima bloccata o se è dentro un layout flex che può espandersi all'infinito, il browser allargherà il box anziché mandare a capo il testo. Per blindarlo, assicurati che il contenitore dei log abbia la larghezza minima/massima vincolata al 100% dello spazio della colonna:
-css
-#log-container {
-    /* ... il tuo stile attuale ... */
-    width: 100%;
-    max-width: 100%;
-    overflow-x: hidden; /* Impedisce la comparsa della barra orizzontale spingendo il testo a capo */
-}
-Usa il codice con cautela.
-Applicando word-break: break-all;, risolverai istantaneamente il problema sul C3, uniformando il comportamento visivo dei log a quello dell'S3.
-Se vuoi, fammi sapere:
-• Se i dati inviati dal C3 sono stringhe continue senza spazi (es. dump esadecimali).
-• Se l'aggiunta di word-break ha risolto il problema del wrap orizzontale sul C3.
-• Se hai bisogno di allineare anche la logica del comando *reset su Arduino per il C3 usando ESP.restart().
-Le risposte dell'AI potrebbero contenere errori. Scopri di più
-        }
-		.info { color: #80ea6e; }
-        .warn { color: #ffb300; }
-        .error { color: #ff5252; }
-        
-        /* Colonna di Destra: Input */
-        .col-right { width: 50%; padding: 20px; display: flex; flex-direction: column; justify-content: center; align-items: center; }
-        .card-input { background-color: #262626; border: 1px solid #444; border-radius: 8px; padding: 30px; width: 80%; max-width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
-        .card-input h3 { margin-top: 0; color: #00bfff; }
-        input[type="text"] { width: 100%; padding: 12px; margin: 15px 0; border: 1px solid #555; border-radius: 4px; background-color: #333; color: #fff; font-size: 16px; }
-        input[type="text"]:focus { border-color: #00bfff; outline: none; }
-        button { width: 100%; padding: 12px; background-color: #00bfff; border: none; border-radius: 4px; color: #1a1a1a; font-size: 16px; font-weight: bold; cursor: pointer; transition: background 0.2s; }
-        button:hover { background-color: #0099cc; }
-        #status-msg { margin-top: 10px; font-size: 14px; text-align: center; }
-    </style>
-</head>
-<body>
-    <h2>Pannello di Controllo ESP32-C3</h2>
-    
-    <div class="container">
-        <!-- COLONNA SINISTRA: LOG -->
-        <div class="col-left">
-            <div id="log-container">
-                <div class="log-entry" style="color: #888;">In attesa di log SCS...</div>
-            </div>
-        </div>
-
-		<!-- COLONNA DESTRA: INPUT -->
-		<div class="col-right">
-			<div class="card-input">
-				<h3>Invia Comando</h3>
-				<!-- Avvolto in un form per gestire l'Invio nativamente -->
-				<form onsubmit="event.preventDefault(); inviaDati();">
-					<input type="text" id="comando-input" placeholder="Scrivi qui il comando..." maxlength="50">
-					<!-- Il bottone diventa di tipo submit -->
-					<button type="submit">Esegui</button>
-				</form>
-				<div id="status-msg"></div>
-			</div>
-		</div>
-
-	</div>
-
-    <script>
-        // Gestione SSE (Log a sinistra)
-        if (!!window.EventSource) {
-            var source = new EventSource('/events');
-            var container = document.getElementById('log-container');
-            source.addEventListener('log', function(e) {
-                // [cls]: Se arriva il comando di pulizia, svuota lo schermo ed esce
-                if (e.data.trim() === '[cls]') {
-//                    container.innerHTML = '<div class="log-entry" style="color: #888;">In attesa di log SCS...</div>';
-                    container.innerHTML = '<div class="log-entry" style="color: #888;"</div>';
-//                    return; // Interrompe l'esecuzione qui
-                }
-                if (container.children.length === 1 && container.children[0].style.color === 'rgb(136, 136, 136)') {
-                    container.innerHTML = '';
-                }
-                // Verifica se la stringa termina con il marcatore [k]
-//                var continuaRiga = e.data.endsWith('[k]');
-                var continuaRiga = e.data.endsWith('.k');
-//                var datiPuliti = continuaRiga ? e.data.slice(0, -3) : e.data; // Rimuove "[k]" se presente
-                var datiPuliti = e.data; // Rimuove "[k]" se presente
-
-                // Ripristina i veri a capo convertendo "\\n" in "\n"
-                var logFormattato = datiPuliti.replace(/\\n/g, '\n').replace(/\n/g, '<br>');
-
-                // Se dobbiamo continuare la riga precedente E esiste già almeno un elemento nel log
-                if (continuaRiga && container.lastElementChild) {
-                    // Appende il testo direttamente dentro l'ultimo div esistente
-                    container.lastElementChild.innerHTML += logFormattato;
-                } else {
-                    // Altrimenti crea una NUOVA riga (comportamento standard)
-                    var entry = document.createElement('div');
-                    entry.className = 'log-entry';
-
-                    // Formatta il testo (es. colora in base al tipo di log)
-                    if (e.data.includes(' TX:')) entry.classList.add('error');
-                    else if (e.data.includes('[CMD]')) entry.classList.add('warn');
-                    else entry.classList.add('info');
-
-                    entry.innerHTML = logFormattato;
-                    container.appendChild(entry);
-                }
-                // Controllo del buffer massimo a 34 righe
-                if (container.children.length > 34) {
-                    container.removeChild(container.firstChild);
-                }
-                // Forza lo scroll del container sempre sull'ultima riga visiva,
-                // risolvendo il problema delle righe lunghe che spingono il testo verso il basso
-                container.scrollTop = container.scrollHeight;
-            }, false);
-            source.addEventListener('open', function(e) {
-                console.log('Flusso log aperto.');
-            }, false);
-            source.addEventListener('chiudi_connessione', function(e) {
-                container.innerHTML = 'Connessione chiusa.';
-                console.log("Il server mi ha chiesto di chiudere.");
-                source.close(); // Questo blocca definitivamente i tentativi di riconnessione automatica del browser
-            });
-        }
-
-        // Invio Input asincrono (Destra) senza ricaricare la pagina
-        function inviaDati() {
-            var inputEl = document.getElementById('comando-input');
-            var statusEl = document.getElementById('status-msg');
-            var valore = inputEl.value.trim();
-            
-            if (valore === "") return;
-
-            statusEl.innerHTML = "Invio in corso...";
-            statusEl.style.color = "#aaa";
-
-            // Utilizziamo Fetch API per fare un POST asincrono all'ESP32
-            fetch('/invia', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: 'testo=' + encodeURIComponent(valore)
-            })
-            .then(response => {
-                if (response.ok) {
-                    statusEl.innerHTML = "Inviato con successo!";
-                    statusEl.style.color = "#00ff66";
-                    inputEl.value = ""; // Svuota il campo di testo
-                } else {
-                    statusEl.innerHTML = "Errore server.";
-                    statusEl.style.color = "#ff5252";
-                }
-            })
-            .catch(error => {
-                statusEl.innerHTML = "Errore di rete.";
-                statusEl.style.color = "#ff5252";
-            });
-        }
-    </script>
-</body>
-</html>
-)rawliteral";
 
 
 bool testWifi(void);
@@ -1212,37 +608,12 @@ WiFiUDP udpConnection;
 #define E_ALEXA       307		// alexa interface max 1
 #define E_FILLER      308		// a disposizione  max 16
 
-#define E_MQTT_TABDEVICES 324	// mqtt_device max 128x4=512 -> 836
-#define E_MQTT_TABLEN       4	// 
-// ==============================================================================================================
-typedef union _DEVICE    {
-  struct {
-        char address;	      
-        char deviceType;		      
-        char alexa_id;		      
-        };
-  struct {
-        char addressW;			      
-        char DeviceType;		      
-        char Alexa_id;		      
-        };
-  struct {
-        long int  Val;			      
-        };
-} DEVADDR;
-// ==============================================================================================================
-DEVADDR device_BUS_id[DEV_NR]; // index:device index,  contenuto: device address reale (scs o knx) e tipo
-char alexa_BUS_ix[DEV_NR];     // index:id alexa, contenuto: device index
-
-// ==============================================================================================================
-#define E_ALEXA_DESC_DEVICE 836 // device description max DEV_NR x E_ALEXA_DESC_LEN char 
-#define E_ALEXA_DESC_LEN     20 // device description max length - top 
-// 836 + 128*20 = 3396
-// ==============================================================================================================
+// =======================================================================================================================
+char alexa_BUS_ix[MY_ENTITA];     // index:id alexa, contenuto: device index
+// =======================================================================================================================
 
 void notFound(AsyncWebServerRequest *request) {
     request->send(404, "text/plain", "Not found");}
-
 
 
 #ifdef VERBOSE
@@ -1299,9 +670,12 @@ void launchWeb(int webtype)
   if (webtype == 1)
 #endif
   {
+    a_server_ptr = new AsyncWebServer(http_port);
+
     createWebServer(webtype);
     // Start the a_server
-//    a_server.begin(HTTP_PORT);
+
+
     a_server.begin();
     webon = 1;
 #ifdef VERBOSE
@@ -1324,9 +698,7 @@ void setupAP(char dbg)
      Serial.setDebugOutput(true);  // <------------ WIFI debug on serial
      Serial.println("AP start");
   }
-#ifdef LOWPOWER
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-#endif
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -1398,9 +770,7 @@ void setupAP(char dbg)
      if (chn[w] == 0) ch = w;
   }  
   WiFi.softAP(ssid, passphrase, ch);
-#ifdef LOWPOWER
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-#endif
   if (dbg)
      Serial.println("softap");
 
@@ -1422,7 +792,8 @@ void setupAP(char dbg)
   }
 }
 // =====================================================================================================
-// ===============================SCRITTURA UART IMMEDIATA FUORI CICLO==================================
+// ===============================SCRITTURA UART IMMEDIATA FUORI CICLO=DA REQUESTBUFFER=================
+// ====================================non loggata======================================================
 void immediateSend(void)
 {
   if (requestLen > 0)
@@ -1569,18 +940,22 @@ void setFirst(void)
 //  requestBuffer[requestLen++] = '@';
 //  requestBuffer[requestLen++] = 0x17; // new - riassume @MX @Y1 F2 @l - ok per knx
 
-  requestBuffer[requestLen++] = '@';
+//  requestBuffer[requestLen++] = '@';
+  requestBuffer[requestLen++] = PIC_REQ;
   requestBuffer[requestLen++] = 0x15; // evita memo in eeprom (in 0x17)
 
-  requestBuffer[requestLen++] = '@'; 
+//  requestBuffer[requestLen++] = '@'; 
+  requestBuffer[requestLen++] = PIC_REQ;
   requestBuffer[requestLen++] = 'M'; // (in 0x17)
   requestBuffer[requestLen++] = 'X'; // (in 0x17)
 
-  requestBuffer[requestLen++] = '@';
+//  requestBuffer[requestLen++] = '@';
+  requestBuffer[requestLen++] = PIC_REQ;
   requestBuffer[requestLen++] = 'Y'; // (in 0x17)
   requestBuffer[requestLen++] = '1'; // (in 0x17)
 
-  requestBuffer[requestLen++] = '@';
+//  requestBuffer[requestLen++] = '@';
+  requestBuffer[requestLen++] = PIC_REQ;
   requestBuffer[requestLen++] = 'F'; // (in 0x17)
   requestBuffer[requestLen++] = '3';
   requestBuffer[requestLen++] = PIC_REQ;
@@ -1589,30 +964,12 @@ void setFirst(void)
 
   firstTime = 1;
   udp_remote_ip = {0, 0, 0, 0}; // kill udp connection
-}
-/*
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-String ReadEEP(int eeaddress) 
-{
-  unsigned char a = 1;
-  unsigned char i;
-  String s = "";
 
-  while (a)
-  {
-    a = EEPROM.read(eeaddress++);
-    if (i++ > 128) a = 0;
-    if ((a < 0x20) || (a > 0x7F))   a = 0;   // only ASCII
-    if (a)  s += char(a);
-  }
-  return s;
+  immediateSend();   // IMMEDIATA senza log sse
+
 }
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-char ReadEEP(int eeaddress) 
-{
-    return = EEPROM.read(eeaddress);
-}
-*/
+
+
 // -----------------------------------------------------------------------------------------------------------------------------------------------
 void WriteEEP(char stream, int eeaddress)
 {
@@ -1710,477 +1067,410 @@ String ReadStream(char * stream, int eeaddress, int len, unsigned char tipo) // 
 }
 
 //--------------------------------------------------------------------
-char WriteDescrOfIx(String edesc, char scsdevX)
-{
-  if (scsdevX < DEV_NR)
-  {
-      WriteEEP(edesc, scsdevX * E_ALEXA_DESC_LEN + E_ALEXA_DESC_DEVICE, E_ALEXA_DESC_LEN);
-      return 1;
-  }
-  return 0;
-}
-//--------------------------------------------------------------------
 
-
-
-
-//--------------------------------------------------------------------
-char ixOfDeviceNew(char device)
-{
-  char x = 1;
-  if (device == 0)  return 0;
-  while (x < DEV_NR)
-  {
-    if (device_BUS_id[x].address == device)
-        return x;
-    else
-    if (device_BUS_id[x].address == 0)
-    { 
-        device_BUS_id[x].address = device;
-        device_BUS_id[x].deviceType = 1;
-        device_BUS_id[x].alexa_id = 0;
-        return x;
+void rigenera_tabella_indice() {
+    // 1. Resetta completamente l'indice impostando tutti i 256 slot a 0xFF (non censito)
+    for (int i = 0; i < 256; i++) {
+        tabella_indice[i].pointer = 0xFF;
     }
-	x++;
-  }
-  return 0;
-}
-//--------------------------------------------------------------------
-char ixOfDeviceNew(char * scsdevice)
-{
-  char *ch;
-  char x = 1;
-  
-  *(scsdevice+2) = 0; // 2 caratteri
-  char device = (char)strtoul(scsdevice, &ch, 16);
 
-  if (device == 0)  return 0;
-
-  while (x < DEV_NR)
-  {
-    if (device_BUS_id[x].address == device)
-        return x;
-    else
-    if (device_BUS_id[x].address == 0)
-    { 
-        device_BUS_id[x].address = device;
-        device_BUS_id[x].deviceType = 1;
-        device_BUS_id[x].alexa_id = 0;
-        return x;
+    // 2. Mappa i dispositivi attivi presenti in RAM
+    for (int i = 0; i < MY_ENTITA; i++) {
+        if (sistema_scs.elenco[i].id != 0) {
+            // Estrae il valore numerico dell'indirizzo memorizzato come stringa
+            uint8_t addr_num = (uint8_t)strtol(sistema_scs.elenco[i].address, NULL, 16);
+            
+            // Assegna la posizione i dell'array a quel byte indice
+            tabella_indice[addr_num].pointer = i;
+        }
     }
-	x++;
-  }
-  return 0;
+    ESP_LOGI("SCS_INDEX", "⚡ Tabella indice diretta rigenerata con successo.");
 }
-//--------------------------------------------------------------------
-char ixOfDevice(char * scsdevice)
-{
-  char *ch;
-  *(scsdevice+2) = 0; // 2 caratteri
-  char device = (char)strtoul(scsdevice, &ch, 16);
-  if (device == 0)  return 0;
 
-  char x = 1;
-  while (x < DEV_NR)
-  {
-    if (device_BUS_id[x].address == device)
-        return x;
+
+void set_device_default(int i, uint8_t nuovo)  // imposta valori di default nuovo dispositivo
+{
+    if ((i < MY_ENTITA) && (i >= 0))
+    {
+        strcpy(sistema_scs.elenco[i].valore_corrente, "0");
+        sistema_scs.elenco[i].ptr_info = -1;
+        sistema_scs.elenco[i].valido = 1;
+        sistema_scs.elenco[i].bits.Val = 0;
+        if (nuovo)
+        {
+            uint8_t addr_num = sistema_scs.elenco[i].id;
+            sprintf(sistema_scs.elenco[i].address,"%02X",addr_num);
+            sistema_scs.elenco[i].alexa_id = 0;
+            sistema_scs.elenco[i].bits.nuova = 1; 
+            // Assegna la posizione i dell'array a quel byte indice
+            tabella_indice[addr_num].pointer = i;
+        }
+        if (nuovo == 2)
+        {
+            sistema_scs.elenco[i].tipo_codice = LUCE;
+            strcpy(sistema_scs.elenco[i].valore_max, "0");
+        }
+        if (sistema_scs.elenco[i].tipo_codice == TAPPARELLA || sistema_scs.elenco[i].tipo_codice == TAPPARELLA_PCT) {
+            strcpy(sistema_scs.elenco[i].stato, "STOP");
+        } else if (sistema_scs.elenco[i].tipo_codice == TERMOSTATO) {
+            strcpy(sistema_scs.elenco[i].stato, " ");
+        } else {
+            strcpy(sistema_scs.elenco[i].stato, "OFF");
+        }
+    }
+}
+
+// 🟢 Variante 1: Ricerca immediata tramite Byte numerico (es. 0x32 o 0xA1)
+uint8_t CercaAddress(uint8_t address) {
+	if (address > 0xAF)
+		return 0xFF;
+	else
+	    return tabella_indice[address].pointer;
+}
+
+uint8_t CercaAddressNew(uint8_t address) {
+	if (address > 0xAF)
+		return 0xFF;
+	else
+    if (tabella_indice[address].pointer != 0xFF)
+        return tabella_indice[address].pointer;
     else
-    if (device_BUS_id[x].address == 0)
-		return 0;
-	x++;
-  }
-  return 0;
+    {
+        for(int i = 0; i < MY_ENTITA; i++) 
+        {
+          if(sistema_scs.elenco[i].valido == 0) 
+          {
+            sistema_scs.elenco[i].id = address;
+            set_device_default(i, 2);
+            return i;
+            break;
+          }
+        } // end for
+        return 0xFF;
+    }
 }
-//--------------------------------------------------------------------
-char ixOfDevice(DEVADDR device)
-{
-  char x = 1;
-  if (device.address == 0)  return 0;
-  while (x < DEV_NR)
-  {
-    if (device_BUS_id[x].address == device.address)
-        return x;
-    else
-    if (device_BUS_id[x].address == 0)
-    return 0;
-  x++;
-  }
-  return 0;
-}
-//--------------------------------------------------------------------
-char ixOfDevice(char device)
-{
-  char x = 1;
-  if (device == 0)  return 0;
-  while (x < DEV_NR)
-  {
-    if (device_BUS_id[x].address == device)
-        return x;
-    else
-    if (device_BUS_id[x].address == 0)
-    return 0;
-  x++;
-  }
-  return 0;
-}
-//--------------------------------------------------------------------
-char DeviceOfIx(char ixdevice)
-{
-  return device_BUS_id[ixdevice].address;
-}
-//--------------------------------------------------------------------
-char DeviceOfIx(char ixdevice, char * busname)
-{
-  sprintf(busname, "%02X", device_BUS_id[ixdevice].address);
-  return device_BUS_id[ixdevice].address;
-}
-//--------------------------------------------------------------------
-char DeviceOfIxPlus(char ixdevice, char * busname)
-{
-  sprintf(busname, "%02X", device_BUS_id[ixdevice].address);
-  return device_BUS_id[ixdevice].address;
-}
-//--------------------------------------------------------------------
-String descrOfIx(char scsdevX)
-{
-  if (scsdevX < DEV_NR)
-  {
-      String edes = ReadStream(&edes[0], (int)E_ALEXA_DESC_DEVICE + (scsdevX * E_ALEXA_DESC_LEN), E_ALEXA_DESC_LEN, 2); // tipo=0 binary array   1:ascii array   2:ascii string
-      return edes;
-  }
-  else
-  {
-      char cdes[E_ALEXA_DESC_LEN];
-      sprintf(cdes, "dispositivo scs %02X", devIx);  // device
-      String edes(cdes);
-      return edes;
-  }
-}
-/*
-//--------------------------------------------------------------------
-void notFound(AsyncWebServerRequest *request) {
-//    request->send(404, "text/plain", "Not found");
-  if (firstTime == 0) setFirst();
-  String message = "File non trovato\n\n";
-  
-  message += "URI: ";
-  message += a_server.uri();
-  message += "\nMethod: ";
-  message += (server.method() == HTTP_GET) ? "GET" : "POST";
-  message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-  for (uint8_t i = 0; i < server.args(); i++) {
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
-  }
+
+// 🟢 Variante 2: Ricerca tramite Stringa Esadecimale (es. "32" o "A1")
+uint8_t CercaAddress(const char *address_str) {
+    if (address_str == NULL || strlen(address_str) == 0) return 0xFF;
     
-  request->send(404, "text/plain", message);
-  WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-  EEPROM.commit();
+    // Converte al volo la stringa esadecimale nel rispettivo byte numerico
+    uint8_t addr_num = (uint8_t)strtol(address_str, NULL, 16);
+    return tabella_indice[addr_num].pointer;
 }
-*/
-
-// =============================================================================================
-char aConvert(String aData)
-{
-  char str[4];
-  char *ptr;
-  long ret;
-  aData.toCharArray(str, 4);
-  str[2] = 0;
-  ret = strtoul(str, &ptr, 16);
-  return (char) ret;
-}
-// =============================================================================================
-word wConvert(String aData)
-{
-  char str[6];
-  char *ptr;
-  long ret;
-  aData.toCharArray(str, 5);
-  str[4] = 0;
-  ret = strtoul(str, &ptr, 16);
-  return (word) ret;
+uint8_t CercaAddressNew(const char *address_str) {
+    if (address_str == NULL || strlen(address_str) == 0) return 0xFF;
+    
+    // Converte al volo la stringa esadecimale nel rispettivo byte numerico
+    uint8_t addr_num = (uint8_t)strtol(address_str, NULL, 16);
+    return CercaAddressNew(addr_num);
 }
 
+
+
+// Traduce il testo dell'HTML nel codice numerico durante il POST /add
+uint8_t decodifica_tipo_a_codice(const char *tipo_str, uint8_t flag_tapparelle) {
+    if (strcmp(tipo_str, "LUC") == 0) return LUCE;
+    if (strcmp(tipo_str, "DIM") == 0) return DIMMER;
+    if (strcmp(tipo_str, "TAP") == 0) return (flag_tapparelle == 1) ? TAPPARELLA_PCT : TAPPARELLA;
+    if (strcmp(tipo_str, "TPC") == 0) return (flag_tapparelle == 1) ? TAPPARELLA_PCT : TAPPARELLA;
+    if (strcmp(tipo_str, "GEN") == 0) return GENERICO;
+    if (strcmp(tipo_str, "ALA") == 0) return ALLARME;
+    if (strcmp(tipo_str, "TER") == 0) return TERMOSTATO;
+    if (strcmp(tipo_str, "INF") == 0) return INFO;
+    if (strcmp(tipo_str, "LOC") == 0) return LOCALE;
+    return LUCE; // Default di sicurezza
+}
+
+// Traduce il codice numerico nel testo da inviare alla tabella HTML (GET /data)
+const char* codifica_codice_a_tipo(uint8_t codice, uint8_t forza=0) {
+    switch (codice) {
+        case LUCE:			  return "LUC";
+        case DIMMER:	    return "DIM";
+        case TAPPARELLA:	
+        case TAPPARELLA_PCT: 
+            if ((!sistema_scs.tapparelle_percentuale) || (forza))
+                return "TAP";
+            else
+                return "TPC";
+        case GENERICO:		return "GEN";
+        case ALLARME:		  return "ALA";
+        case TERMOSTATO:	return "TER";
+        case INFO:			  return "INF";
+        case LOCALE:		  return "LOC";
+        default: return "LUC";
+    }
+}
+
+
+#include <Preferences.h>
+
+void salva_dispositivi_preferences() {
+    Preferences prefs;
+	uint8_t counter = 0;
+    // Apre il namespace "scs_data" (il flag false significa "modalità scrittura")
+    if (prefs.begin("scs_data", false)) {
+        
+        prefs.putUChar("tap_pct", sistema_scs.tapparelle_percentuale);
+        
+        for (int i = 0; i < MY_ENTITA; i++) {
+            String chiave = "d" + String(i);
+            
+            if ((sistema_scs.elenco[i].id != 0) && (sistema_scs.elenco[i].valido == 1)) {
+                char buffer_csv[128];
+                snprintf(buffer_csv, sizeof(buffer_csv), "%d,%s,%d,%s,%s,%d",
+                         sistema_scs.elenco[i].id,
+                         sistema_scs.elenco[i].address,
+                         sistema_scs.elenco[i].tipo_codice,
+                         sistema_scs.elenco[i].descrizione,
+                         sistema_scs.elenco[i].valore_max,
+                         sistema_scs.elenco[i].alexa_id);
+                         
+                prefs.putString(chiave.c_str(), buffer_csv);
+				counter++;
+            } else {
+                // Rimuove la chiave se lo slot è vuoto (gestisce l'assenza internamente senza errori)
+                prefs.remove(chiave.c_str());
+            }
+        }
+        prefs.end(); // Esegue il commit e chiude automaticamente
+
+        if (events.count() != 0) 
+        {
+          char buflog[120];
+          sprintf(buflog,"[%d] [CMD] Salvataggio NVS completato con Preferences! %d elementi",(millis()/100), counter);
+          events.send(buflog, "log", millis());
+        }
+  
+		ESP_LOGI("NVS_SCS", "💾 Salvataggio completato con Preferences!");
+    }
+}
+
+
+
+void inizializza_e_leggi_dispositivi_preferences() {
+    // Azzera preventivamente tutta la memoria RAM per partire da una situazione immacolata
+    memset(&sistema_scs, 0, sizeof(ConfigurazioneGlobale));
+    for (int i = 0; i < MY_ENTITA; i++) {
+        sistema_scs.elenco[i].id = 0; // Slot vuoti di base
+        strcpy(sistema_scs.elenco[i].stato, "OFF");
+        strcpy(sistema_scs.elenco[i].valore_corrente, "0");
+        sistema_scs.elenco[i].ptr_info = -1;
+        sistema_scs.elenco[i].valido = 0;
+        sistema_scs.elenco[i].bits.Val = 0;
+        sistema_scs.elenco[i].alexa_id = 0;
+    }
+    sistema_scs.tapparelle_percentuale = 0;
+
+    for (int i = 0; i < MAX_INFO; i++) {
+        cardinfo[i].id = -1; // Slot vuoti di base
+        memset(cardinfo[i].info_0, 0, sizeof(cardinfo[i].info_0));
+    }
+
+    Preferences prefs;
+	uint8_t counter = 0;
+
+	// Apriamo il namespace "scs_data" in modalità sola lettura (true)
+    if (prefs.begin("scs_data", true)) {
+        
+        // Legge il flag tapparelle (se non esiste nella NVS, restituisce il valore di default 0)
+        sistema_scs.tapparelle_percentuale = prefs.getUChar("tap_pct", 0);
+
+        // Ricostruisce l'array leggendo le singole stringhe CSV memorizzate
+        for (int i = 0; i < MY_ENTITA; i++) {
+            // CORRETTO: Portato a 16 byte per evitare stack overflow con indici alti (es. d10, d100)
+            char chiave[16];
+            snprintf(chiave, sizeof(chiave), "d%d", i);
+
+            // Verifichiamo se la chiave esiste prima di allocare o leggere
+            if (prefs.isKey(chiave)) {
+                // Leggiamo la stringa direttamente dalla NVS
+                String csv_string = prefs.getString(chiave, "");
+                
+                if (csv_string.length() > 0) {
+                    int parsed_id = 0;
+                    int parsed_tipo = 1;
+                    char parsed_addr[4] = "";
+                    char parsed_desc[25] = "";
+                    char parsed_val_max[8] = "";
+                    int parsed_alexa_id = 0;
+
+                    // Parsing sicuro estraendo il puntatore char* della stringa Arduino (.c_str())
+                    sscanf(csv_string.c_str(), "%d,%[^,],%d,%[^,],%s", 
+                           &parsed_id, parsed_addr, &parsed_tipo, parsed_desc, parsed_val_max, &parsed_alexa_id);
+
+                    sistema_scs.elenco[i].id = parsed_id;
+                    sistema_scs.elenco[i].tipo_codice = (uint8_t)parsed_tipo;
+                    strcpy(sistema_scs.elenco[i].address, parsed_addr);
+                    strcpy(sistema_scs.elenco[i].descrizione, parsed_desc);
+                    strcpy(sistema_scs.elenco[i].valore_max, parsed_val_max);
+                    sistema_scs.elenco[i].alexa_id = parsed_alexa_id;
+                    
+                    set_device_default(i, 0);
+
+					counter++;
+                }
+            }
+        }
+        // Chiudiamo il database per liberare le risorse hardware della NVS
+        prefs.end();
+        if (events.count() != 0) 
+        {
+            char buflog[120];
+            sprintf(buflog,"[%d] [CMD] Rilettura NVS completata con Preferences! %d elementi",(millis()/100), counter);
+            events.send(buflog, "log", millis());
+        }
+    }
+  rigenera_tabella_indice();
+}
+
+void cancella_vecchia_eeprom() {
+    Preferences prefs;
+    
+    // La libreria EEPROM dell'ESP32 usa internamente il namespace "eeprom"
+    if (prefs.begin("eeprom", false)) {
+        
+        // Cancella TUTTI i dati memorizzati dentro questo specifico namespace
+        if (prefs.clear()) {
+            Serial.println("🧹 Vecchi dati EEPROM rimossi con successo dalla NVS!");
+        } else {
+            Serial.println("❌ Errore durante la cancellazione della EEPROM.");
+        }
+        
+        prefs.end();
+    }
+}
+
+
+// Funzione helper inline per leggere 2 caratteri esadecimali senza modificare il buffer originale
+// Legge 2 caratteri esadecimali da un puntatore const char*
+// Converte un singolo carattere ASCII esadecimale ('0'-'9', 'A'-'F', 'a'-'f') nel suo valore 0-15
+inline uint8_t hexCharToVal(char c) {
+  if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
+  if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
+  if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
+  return 0;
+}
+
+// Legge 2 caratteri esadecimali da un puntatore senza usare array né strtoul
+inline uint8_t parseHexByte(const char* ptr) {
+  return (hexCharToVal(*ptr) << 4) | hexCharToVal(*(ptr + 1));
+}
+// =============================================================================================
+inline uint8_t aConvert(const char* aData) {
+  if (!aData || !aData[0] || !aData[1]) return 0; // Protezione da stringhe corte o nulle
+  return (hexCharToVal(aData[0]) << 4) | hexCharToVal(aData[1]);
+}
+inline uint8_t aConvert(const String& aData) {
+    return aConvert(aData.c_str());
+}
+// =============================================================================================
+inline uint16_t wConvert(const char* aData) {
+  // Verifica che ci siano almeno 4 caratteri validi prima del terminatore '\0'
+  if (!aData || !(*aData) || !(*(aData + 1)) || !(*(aData + 2)) || !(*(aData + 3))) {
+    return 0;
+  }
+
+  // Legge i primi 2 caratteri (byte alto) e i successivi 2 caratteri (byte basso)
+  return ((uint16_t)aConvert(aData) << 8) | (uint16_t)aConvert(aData + 2);
+}
+
+inline uint16_t wConvert(const String& aData) {
+  return wConvert(aData.c_str());
+}
+// =============================================================================================
 // devtype: 1=SWITCH, 3=LIGHT, 4=LIGHT, 8=COVER, 11=GENERIC, 14=ALARM BOARD, 15=termostato, 18=COVER, 19=COVER PCT
-
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-char  MQTTnewdiscover(char devtype, char * addrDevice, String nomeDevice)
+size_t MQTTnewdiscover(char devtype, const char* addrDevice, const char* nomeDevice, char* logBuffer, size_t logMaxLen)
 {
+  constexpr size_t TOPIC_MAX_LEN   = 128;
+  constexpr size_t PAYLOAD_MAX_LEN = 512;
+  constexpr size_t LOG_MAX_LEN     = TOPIC_MAX_LEN + PAYLOAD_MAX_LEN;
+
+  char topic[TOPIC_MAX_LEN];
+  char payload[PAYLOAD_MAX_LEN];
+  int len = 0;
   char rc = 0;
-  String topic;
-  String payload;
-  if (devtype == 1)  // D=define new device SWITCH <<<-----------------------------------------------
+
+  if (devtype == 1)  // D=define new device SWITCH
   {
     rc = 1;
-    topic   = NEW_SWITCH_TOPIC;
-    topic  += addrDevice;
-    topic  += NEW_CONFIG_TOPIC;
-
-    payload = NEW_DEVICE_NAME;
-    payload += nomeDevice;
-    payload += NEW_SWITCH_SET;
-    payload += addrDevice;
-    payload += NEW_SWITCH_STATE;
-//    payload += addrDevice;
-//    payload += NEW_DEVICE_END;
+    snprintf(topic, sizeof(topic), "%s%s%s", NEW_SWITCH_TOPIC, addrDevice, NEW_CONFIG_TOPIC);
+    len = snprintf(payload, sizeof(payload), "%s%s%s%s%s",
+                   NEW_DEVICE_NAME, nomeDevice,
+                   NEW_SWITCH_SET, addrDevice,
+                   NEW_SWITCH_STATE);
   }
-  else if ((devtype == 3) || (devtype == 4)) // D=define new device DIMMER <<<-----------------------------------------------
+  else if ((devtype == 3) || (devtype == 4)) // D=define new device DIMMER
   {
     rc = 1;
-    topic   = NEW_LIGHT_TOPIC;
-    topic  += addrDevice;
-    topic  += NEW_CONFIG_TOPIC;
-
-    payload = NEW_DEVICE_NAME;
-    payload += nomeDevice;
-    payload += NEW_LIGHT_SET;
-    payload += addrDevice;
-    payload += NEW_LIGHT_STATE;
-    payload += addrDevice;
-    payload += NEW_BRIGHT_SET;
-    payload += addrDevice;
-    payload += NEW_BRIGHT_STATE;
-//    payload += addrDevice;
-//    payload += NEW_DEVICE_END;
+    snprintf(topic, sizeof(topic), "%s%s%s", NEW_LIGHT_TOPIC, addrDevice, NEW_CONFIG_TOPIC);
+    len = snprintf(payload, sizeof(payload), "%s%s%s%s%s%s%s%s%s",
+                   NEW_DEVICE_NAME, nomeDevice,
+                   NEW_LIGHT_SET, addrDevice,
+                   NEW_LIGHT_STATE, addrDevice,
+                   NEW_BRIGHT_SET, addrDevice,
+                   NEW_BRIGHT_STATE);
   }
-  else if ((devtype == 8) || (devtype == 18)) // D=define new device COVER <<<-----------------------------------------------
+  else if ((devtype == 8) || (devtype == 18)) // D=define new device COVER
   {
     rc = 1;
-    topic   = NEW_COVER_TOPIC;
-    topic  += addrDevice;
-    topic  += NEW_CONFIG_TOPIC;
-
-    payload = NEW_DEVICE_NAME;
-    payload += nomeDevice;
-    payload += NEW_COVER_SET;
-    payload += addrDevice;
-    payload += NEW_COVER_STATE;
-//    payload += addrDevice;
-//    payload += NEW_DEVICE_END;
+    snprintf(topic, sizeof(topic), "%s%s%s", NEW_COVER_TOPIC, addrDevice, NEW_CONFIG_TOPIC);
+    len = snprintf(payload, sizeof(payload), "%s%s%s%s%s",
+                   NEW_DEVICE_NAME, nomeDevice,
+                   NEW_COVER_SET, addrDevice,
+                   NEW_COVER_STATE);
   }
-  else if (devtype == 11) // D=define new device GENERIC <<<-----------------------------------------------
+  else if (devtype == 11) // D=define new device GENERIC
   {
     rc = 1;
-    topic   = NEW_GENERIC_TOPIC;
-    topic  += addrDevice;
-    topic  += NEW_CONFIG_TOPIC;
-
-    payload = NEW_DEVICE_NAME;
-    payload += nomeDevice;
-    payload += NEW_GENERIC_SET;
-    payload += addrDevice;
-    payload += NEW_GENERIC_FROM;
-    payload += addrDevice;
-    payload += NEW_GENERIC_TO;
-//    payload += addrDevice;
-//    payload += NEW_DEVICE_END;
+    snprintf(topic, sizeof(topic), "%s%s%s", NEW_GENERIC_TOPIC, addrDevice, NEW_CONFIG_TOPIC);
+    len = snprintf(payload, sizeof(payload), "%s%s%s%s%s%s%s",
+                   NEW_DEVICE_NAME, nomeDevice,
+                   NEW_GENERIC_SET, addrDevice,
+                   NEW_GENERIC_FROM, addrDevice,
+                   NEW_GENERIC_TO);
   }
-  else if ((devtype == 9) || (devtype == 19)) // D=define new device COVER PCT<<<-----------------------------------------------
+  else if ((devtype == 9) || (devtype == 19)) // D=define new device COVER PCT
   {
     rc = 1;
-    topic   = NEW_COVERPCT_TOPIC;
-    topic  += addrDevice;
-    topic  += NEW_CONFIG_TOPIC;
+    snprintf(topic, sizeof(topic), "%s%s%s", NEW_COVERPCT_TOPIC, addrDevice, NEW_CONFIG_TOPIC);
+    len = snprintf(payload, sizeof(payload), "%s%s%s%s%s%s%s",
+                   NEW_DEVICE_NAME, nomeDevice,
+                   NEW_COVER_SET, addrDevice,
+                   NEW_COVERPCT_SET, addrDevice,
+                   NEW_COVERPCT_STATE);
+  }
+  else if (devtype == 14) // 0x0E) D=define new device ALARM BOARD
+  {
+  }
 
-    payload  = NEW_DEVICE_NAME;
-    payload += nomeDevice;
-    payload += NEW_COVER_SET;
-    payload += addrDevice;
-    payload += NEW_COVERPCT_SET;
-    payload += addrDevice;
-    ///      payload += NEW_COVER_STATE;  // cover percentuale, meglio non trattare lo stato
-    ///      payload += addrDevice;       //                    ma solo la posizione
-    payload += NEW_COVERPCT_STATE;
-//    payload += addrDevice;
-//    payload += NEW_DEVICE_END;
-  }
-  else if (devtype == 14) // 0x0E) // D=define new device ALARM BOARD<<<-----------------------------------------------
+  if (rc == 1 && len > 0 && (size_t)len < sizeof(payload))
   {
+    // Aggiunge la parte finale comune direttamente in coda a 'payload'
+    snprintf(payload + len, sizeof(payload) - len, "%s%s%s%s",
+             addrDevice, NEW_UNIQUE_ID, addrDevice, NEW_DEVICE_END);
+
+    client.publish(topic, payload, false);
+
+    if (logBuffer != nullptr && logMaxLen > 0)
+    {
+      int written = snprintf(logBuffer, logMaxLen, "%s%s\n", topic, payload);
+      if (written > 0) {
+        return ((size_t)written < logMaxLen) ? (size_t)written : (logMaxLen - 1);
+      }
+    }
   }
-  if (rc == 1)
-  {
-    payload += addrDevice;
-    payload += NEW_UNIQUE_ID;
-    payload += addrDevice;
-    payload += NEW_DEVICE_END;
-    const char* cPayload = payload.c_str();
-    const char* cTopic = topic.c_str();
-    client.publish(cTopic, cPayload, false);
-  }
+
   return rc;
 }
 
-
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-char  MQTTnewdevice(char devIx, char* nomedevice)  // KNX
-{
-// DEVADDR device_BUS_id[DEV_NR]; // pointer: eventuale id alexa - contenuto: device address reale (scs o knx) e tipo
-
-  char devicename[6];
-  DeviceOfIx(devIx, devicename);
-
-  if (nomedevice) memcpy(nomedevice,devicename,6);
-
-  String edesc = descrOfIx(devIx);
-  if (mqttopen == 3)
-  {
-    if ((edesc[0] == 0) || (edesc[0] == 0xFF) || (edesc == ""))
-      MQTTnewdiscover(device_BUS_id[devIx].deviceType, devicename, devicename);
-    else
-      MQTTnewdiscover(device_BUS_id[devIx].deviceType, devicename, edesc);
-  }
-  return devIx;
-}
-
-// =====================================================================================================
-void newTest()
-{
-  char apice = 39;
-  char linea = 10;
-
-  content = R"=====(
-<!DOCTYPE html>
-<html>
-    <head>
-        <meta charset="utf-8">
-        <meta http-equiv="X-UA-Compatible" content="IE=edge">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Home Controller</title>
-        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script> 
-        <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.4.1/css/bootstrap.min.css" integrity="sha384-Vkoo8x4CGsO3+Hhxv8T/Q5PaXtkKtu6ug5TOeNV6gBiFeWPGFN9MuhOf23Q9Ifjh" crossorigin="anonymous">
-    </head>
-    <body style="padding-left: 10px">
-        <h2 style="text-align: center; margin-top: 0px">LUCI</h2>
-        <br/>
-)=====";
-
-// ------------------------------ luci --------------------------------------------------------
-
-        char devtype;
-        char nomeDevice[6];
-        char devx = 1;
-        while ((devx < DEV_NR) && (device_BUS_id[devx].addressW))
-        {
-          devtype = device_BUS_id[devx].deviceType;
-          if ((devtype == 1) || (devtype == 4))
-          {
-            DeviceOfIx(devx, (char *)nomeDevice);
-            content += " <div class=\"row\">";
-            content += " <div class=\"col-6\">";
-            content += descrOfIx(devx);
-
-            content += "</div><div class=\"col-2\" style=\"color: green\" onclick=\"callAPI2(";
-            content += apice;
-            content += nomeDevice;
-            content += apice;
-            content += ",\'00\')\">ON</div>";
-
-            content += "<div class=\"col-2\" style=\"color: red\" onclick=\"callAPI2(";
-            content += apice;
-            content += nomeDevice;
-            content += apice;
-            content += ",\'01\')\">OFF</div></div>";
-            content += R"=====(
-)=====";
-            
-          } // devtype == 1
-          devx++;
-        }  // while
-
-        content += R"=====(
-        <br/>
-        <h2 style="text-align: center; margin-top: 0px">TAPPARELLE</h2>
-        <br/>
-)=====";
-
-// ------------------------------ tapparelle --------------------------------------------------
-
-        char nomeDevicePlus[6];
-        devx = 1;
-        while ((devx < DEV_NR) && (device_BUS_id[devx].addressW))
-        {
-          devtype = device_BUS_id[devx].deviceType;
-          if ((devtype == 8) || (devtype == 9) || (devtype == 18) || (devtype == 19))
-          {
-            DeviceOfIx(devx, (char *)nomeDevice);
-            DeviceOfIxPlus(devx, (char *)nomeDevicePlus);
-            content += " <div class=\"row\">";
-            content += " <div class=\"col-5\">";
-            content += descrOfIx(devx);
-
-            content += "</div><div class=\"col-2\" style=\"color: green\" onclick=\"callAPI2(";
-            content += apice;
-            content += nomeDevicePlus;
-            content += apice;
-            content += ",\'08\')\">UP</div>";
-            content += "<div class=\"col-3\" style=\"color: red\" onclick=\"callAPI2(";
-            content += apice;
-            content += nomeDevicePlus;
-            content += apice;
-            content += ",\'09\')\">DOWN</div>";
-            content += "<div class=\"col-2\" style=\"color: blue\" onclick=\"callAPI2(";
-            content += apice;
-            content += nomeDevice;
-            content += apice;
-            content += ",\'0A\')\">STOP</div></div>";
-            content += R"=====(
-)=====";
-            
-          } // devtype == 1
-          devx++;
-        }  // while
+// Overload per mantenere la compatibilità con chiamate esistenti che passano una String
+//inline size_t MQTTnewdiscover(char devtype, const char* addrDevice, const String& nomeDevice, char* logBuffer, size_t logMaxLen)
+//{
+//  return MQTTnewdiscover(devtype, addrDevice, nomeDevice.c_str(), logBuffer, logMaxLen);
+//}
 
 
-
-  content += R"=====(
-        <br/>
-    </body>
-    <script>
-        function callAPI2(to, cmd) {
-            var request = new XMLHttpRequest()
-)=====";
-
-
-  content += "                request.open('GET', 'http://";
-  content += WiFi.localIP().toString();
-  if (alexaParam == 'y')
-      content += ":8080";
-  
-  content += "/gate?to=";
-  content += apice;
-  
-  content += " + to + '&cmd=' + cmd + '&resp=y', true)";  // non si riesce a mettere un apice dopo 0C
-
-  content += R"=====(
-            request.send()
-        }
-        function callAPI(to,cmd) {
-            callAPI2('0C' + to, cmd);
-        }
-    </script>
-</html>
-)=====";
-  
-}
-/*
-// =============================================================================================
-
-void handleClear()
-{
-  content = "<!DOCTYPE HTML>\r\n<html>";
-  content += "<p>Clearing the EEPROM - reboot.</p></html>";
-  server.send(200, "text/html", content);
-  content = "";
-  for (int i = 0; i < 4096; ++i) {
-    EEPROM.write(i, 0);
-  }
-  EEPROM.commit();
-  WiFi.disconnect();
-}
-*/
 
 // =============================================================================================
 void WriteError(const char *msgLog)
@@ -2221,255 +1511,184 @@ char reconnect()
   }
 }
 
-// ===============================================================================================
-// MQTT callback function  - comando proveniente da MQTT:  desktop o pulsante fisico
-// ===============================================================================================
+
+
+
+
+
+
+
+
+//==============================================================================================================
 void MqttCallback(char* topic, byte* payload, unsigned int length)
 // =============================================================================================================
 // ================================ messaggio MQTT in arrivo (comando web) =====================================
 // =============================================================================================================
 {
-  int i = 0;
-  char dev[5];
-  char *ch;
   unsigned char devtype = 0;
   char packetBuffer[255];
 
   unsigned char device = 0xFF;
-
   unsigned char reply = 0;
   unsigned char command = 0xFF;
-  String rtopic;
+  const char* rtopicBase = nullptr;
 
+  // Copia sicura del payload con terminatore nullo
+  size_t copyLen = (length < sizeof(packetBuffer) - 1) ? length : (sizeof(packetBuffer) - 1);
+  memcpy(packetBuffer, payload, copyLen);
+  packetBuffer[copyLen] = '\0';
 
-  // create character buffer with ending null terminator (string)
-  for (i = 0; i < length; i++) {
-    packetBuffer[i] = payload[i];
-  }
-  packetBuffer[i] = '\0';
-
-  String payloads = String(packetBuffer);
-  String topicString = String(topic);
-          
 #ifdef USE_TCPSERVER
   if ((tcpuart == 2) && (tcpclient) && (tcpclient.connected())) 
   {
-    String log = "\r\nsub: ";
-    log += topicString;
-    log += " ";
-    log += payloads;
-    tcpclient.write((char*)&log[0], log.length());
+    tcpclient.print("\r\nsub: ");
+    tcpclient.print(topic);
+    tcpclient.print(" ");
+    tcpclient.println(packetBuffer);
     tcpclient.flush(); 
   }
 #endif
-          
 
-  if (firstTime == 0) setFirst();
+  if (firstTime == 0) 
+  {
+    setFirst();
+    internal = 1;
+  }
+
+  constexpr size_t lenSwitch   = sizeof(SWITCH_SET) - 1;
+  constexpr size_t lenBright   = sizeof(BRIGHT_SET) - 1;
+  constexpr size_t lenCoverPct = sizeof(COVERPCT_SET) - 1;
+  constexpr size_t lenGeneric  = sizeof(GENERIC_SET) - 1;
+  constexpr size_t lenCover    = sizeof(COVER_SET) - 1;
 
   // --------------------------------------- SWITCHES -------------------------------------------
-  if (topicString.substring(0, sizeof(SWITCH_SET) - 1) == SWITCH_SET)
+  if (strncmp(topic, SWITCH_SET, lenSwitch) == 0)
   {
     devtype = 1; // switch
-    rtopic = SWITCH_STATE;
+    rtopicBase = SWITCH_STATE;
     reply = 1;
-    dev[0] = *(topic + sizeof(SWITCH_SET) - 1);
-    dev[1] = *(topic + sizeof(SWITCH_SET));
-    dev[2] = 0;
-    device = (char)strtoul(dev, &ch, 16);
-    if (payloads.substring(0, 2) == "ON")
+    device = parseHexByte(topic + lenSwitch);
+
+    if (strncmp(packetBuffer, "ON", 2) == 0) {
       command = 0x00;
-    else if (payloads.substring(0, 3) == "OFF")
+    } else if (strncmp(packetBuffer, "OFF", 3) == 0) {
       command = 0x01;
-  }
-  // ----------------------------------------------------------------------------------------------
-  else
-
-    // --------------------------------------- LIGHTS DIMM ------------------------------------------
-    if (topicString.substring(0, sizeof(BRIGHT_SET) - 1) == BRIGHT_SET)
-    {
-#ifdef DEBUG
-      rtopic = BRIGHT_STATE;
-      Serial.println("dimmer");
-#endif
-      dev[0] = *(topic + sizeof(BRIGHT_SET) - 1);
-      dev[1] = *(topic + sizeof(BRIGHT_SET));
-      dev[2] = 0;
-      device = (char)strtoul(dev, &ch, 16);
-      devtype = 3; // light
-      if (payloads.substring(0, 2) == "ON")  // trasformare da % a 1D-9D <--------------------------------------------------------------
-        command = 0x00;  // on/up
-      else if (payloads.substring(0, 3) == "OFF")
-        command = 0x01; // off/down
-      else
-      {
-        int pct = atoi(packetBuffer);    // percentuale
-        // --------------- percentuale da 1 a 255 (home assistant) -----------
-        if ((domoticMode == 'h') || (domoticMode == 'H'))   // h=as homeassistant
-        { // percentuale 0-255
-          pct *= 100;                  // da 0 a 25500
-          pct /= 255;                  // da 0 a 100
-        }
-        // --------------- percentuale da 1 a 100 (domoticz) -----------------
-        // percentuale 0-100
-        pct += 5;                    // arrotondamento
-        pct /= 10;                   // 0-10
-        if (pct > 9) pct = 9;
-        if (pct == 0) pct = 1;		    // 1-9
-        pct *= 16;                   // hex high nibble
-        pct += 0x0D;                 // hex low  nibble
-        command = (unsigned char) pct;
-
-#ifdef DEBUG
-        Serial.println(" payload " + content);
-        //     char hBuffer[4];
-        //     sprintf(hBuffer, "%02X", pct);
-        // ricalcolare payloads per debug
-        char action = pct;
-        action >>= 4;
-        action *= 10;  // percentuale 10-90
-        char actionc[4];
-        sprintf(actionc, "%02u", action);
-        payloads = String(actionc);
-#endif
-      }
     }
-  // ----------------------------------------------------------------------------------------------
-    else
-
-
-
-
-
-      // --------------------------------------- COVERPCT ------------------------------------------------
-      if (topicString.substring(0, sizeof(COVERPCT_SET) - 1) == COVERPCT_SET)
-      {
+  }
+  // --------------------------------------- LIGHTS DIMM ------------------------------------------
+  else if (strncmp(topic, BRIGHT_SET, lenBright) == 0)
+  {
 #ifdef DEBUG
-        Serial.println("cover%");
+    rtopicBase = BRIGHT_STATE;
+    Serial.println("dimmer");
 #endif
-        rtopic = COVERPCT_STATE;
-        //    reply = 1;  // TEST
-        dev[0] = *(topic + sizeof(COVERPCT_SET) - 1);
-        dev[1] = *(topic + sizeof(COVERPCT_SET));
-        dev[2] = 0;
-        device = (word)strtoul(dev, &ch, 16);
-        devtype = 9; // coverpct
+    device = parseHexByte(topic + lenBright);
+    devtype = 3; // light
 
-        if (payloads.substring(0, 4) == "STOP")
-        {
-          command = 0;
-        }
-        else if (payloads.substring(0, 2) == "ON")  // discesa - chiudi
-        {
-          command = 2;
-        }
-        else if (payloads.substring(0, 5) == "CLOSE")  // discesa - chiudi
-        {
-          command = 2;
-        }
-        else if (payloads.substring(0, 3) == "OFF") // salita - apri
-        {
-          command = 1;
-// in domoticz 
-        }
-        else if (payloads.substring(0, 4) == "OPEN") // salita - apri
-        {
-          command = 1;
-        }
-        else
-        {
-          int pct = atoi(packetBuffer);    // percentuale
-          command = (unsigned char) pct;
-        }
+    if (strncmp(packetBuffer, "ON", 2) == 0) {
+      command = 0x00; // on/up
+    } else if (strncmp(packetBuffer, "OFF", 3) == 0) {
+      command = 0x01; // off/down
+    } else {
+      int pct = atoi(packetBuffer);
+      
+      if ((domoticMode == 'h') || (domoticMode == 'H')) {
+        pct = (pct * 100) / 255;
       }
-  // ----------------------------------------------------------------------------------------------
-      else
+      
+      pct = (pct + 5) / 10;
+      if (pct > 9) pct = 9;
+      if (pct == 0) pct = 1;
+      
+      command = (unsigned char)((pct << 4) | 0x0D);
 
+#ifdef DEBUG
+      unsigned char action = (command >> 4) * 10;
+      snprintf(packetBuffer, sizeof(packetBuffer), "%02u", action);
+      Serial.print(" payload ");
+      Serial.println(packetBuffer);
+#endif
+    }
+  }
+  // --------------------------------------- COVERPCT ------------------------------------------------
+  else if (strncmp(topic, COVERPCT_SET, lenCoverPct) == 0)
+  {
+#ifdef DEBUG
+    Serial.println("cover%");
+#endif
+    rtopicBase = COVERPCT_STATE;
+    device = parseHexByte(topic + lenCoverPct);
+    devtype = 9; // coverpct
 
-  // --------------------------------------- GENERIC  -------------------------------------------
-  if (topicString.substring(0, sizeof(GENERIC_SET) - 1) == GENERIC_SET)
+    if (strncmp(packetBuffer, "STOP", 4) == 0) {
+      command = 0;
+    } else if (strncmp(packetBuffer, "ON", 2) == 0 || strncmp(packetBuffer, "CLOSE", 5) == 0) {
+      command = 2; // discesa - chiudi
+    } else if (strncmp(packetBuffer, "OFF", 3) == 0 || strncmp(packetBuffer, "OPEN", 4) == 0) {
+      command = 1; // salita - apri
+    } else {
+      command = (unsigned char)atoi(packetBuffer);
+    }
+  }
+  // --------------------------------------- GENERIC -------------------------------------------
+  else if (strncmp(topic, GENERIC_SET, lenGeneric) == 0)
   {
     devtype = 11; // generic
-    rtopic = GENERIC_TO;
+    rtopicBase = GENERIC_TO;
     reply = 0;
-    dev[0] = *(topic + sizeof(GENERIC_SET) - 1);
-    dev[1] = *(topic + sizeof(GENERIC_SET));
-    
+    device = parseHexByte(topic + lenGeneric);
+
+    // packet: ffttcc -> <from> <type> <command>
+    char from = parseHexByte(packetBuffer);
+    char type = parseHexByte(packetBuffer + 2);
+    command   = parseHexByte(packetBuffer + 4);
+
     requestBuffer[requestLen++] = PIC_REQ;
-
-	char from;
-	char type;
-	
-    requestBuffer[requestLen++] = 'y';		// 0x79 (@y: invia a pic da MQTT cmd standard da inviare sul bus)
-
-    dev[2] = 0;
-    device = (char)strtoul(dev, &ch, 16);
-
-    packetBuffer[6] = 0;        // packet: ffttcc ->  <from> <type> <command>
-    command = (char)strtoul(&packetBuffer[4], &ch, 16);
-    packetBuffer[4] = 0;
-    type = (char)strtoul(&packetBuffer[2], &ch, 16);
-    packetBuffer[2] = 0;
-    from = (char)strtoul(&packetBuffer[0], &ch, 16);
-
-    requestBuffer[requestLen++] = device; // to   device
-    requestBuffer[requestLen++] = from;   // from device
-    requestBuffer[requestLen++] = type;   // type:command
-    requestBuffer[requestLen++] = command;// command
+    requestBuffer[requestLen++] = 'y';     // 0x79
+    requestBuffer[requestLen++] = device;  // to device
+    requestBuffer[requestLen++] = from;    // from device
+    requestBuffer[requestLen++] = type;    // type:command
+    requestBuffer[requestLen++] = command; // command
   }
-  // ----------------------------------------------------------------------------------------------
-  else
-
-
-
-
-
-
-
-
-        // --------------------------------------- COVER ------------------------------------------------
-        if (topicString.substring(0, sizeof(COVER_SET) - 1) == COVER_SET)
-        {
-#ifdef DEBUG
-          Serial.println("cover");
-#endif
-          rtopic = COVER_STATE;
-          reply = 1;
-          devtype = 8; // cover
-          dev[0] = *(topic + sizeof(COVER_SET) - 1);
-          dev[1] = *(topic + sizeof(COVER_SET));
-          dev[2] = 0;
-          device = (char)strtoul(dev, &ch, 16);
-          if (payloads.substring(0, 2) == "ON")   // discesa - chiudi
-            command = 0x09;
-          else if (payloads.substring(0, 5) == "CLOSE")  // discesa - chiudi
-          {
-            command = 0x09;
-          }
-          else if (payloads.substring(0, 3) == "OFF") // salita - apri
-            command = 0x08;
-          else if (payloads.substring(0, 4) == "OPEN") // salita - apri
-          {
-            command = 0x08;
-          }
-          else if (payloads.substring(0, 4) == "STOP")
-            command = 0x0A;
-        }
-  // ----------------------------------------------------------------------------------------------
-
-  if (reply == 1)
+  // --------------------------------------- COVER ------------------------------------------------
+  else if (strncmp(topic, COVER_SET, lenCover) == 0)
   {
-    if ((domoticMode == 'h') || (domoticMode == 'H')) // home assistant
+#ifdef DEBUG
+    Serial.println("cover");
+#endif
+    rtopicBase = COVER_STATE;
+    reply = 1;
+    devtype = 8; // cover
+    device = parseHexByte(topic + lenCover);
+
+    if (strncmp(packetBuffer, "ON", 2) == 0 || strncmp(packetBuffer, "CLOSE", 5) == 0) {
+      command = 0x09; // discesa - chiudi
+    } else if (strncmp(packetBuffer, "OFF", 3) == 0 || strncmp(packetBuffer, "OPEN", 4) == 0) {
+      command = 0x08; // salita - apri
+    } else if (strncmp(packetBuffer, "STOP", 4) == 0) {
+      command = 0x0A;
+    }
+  }
+
+  // --------------------------------------- REPLY MQTT -------------------------------------------
+  if (reply == 1 && rtopicBase != nullptr)
+  {
+    const char* outPayload = packetBuffer;
+
+    if ((domoticMode == 'h') || (domoticMode == 'H'))
     {
-      if (payloads.substring(0, 5) == "CLOSE")   // discesa - chiudi
-        payloads = "closed";
-      else if (payloads.substring(0, 4) == "OPEN")  // salita - apri
-        payloads = "open";
+      if (strncmp(packetBuffer, "CLOSE", 5) == 0) {
+        outPayload = "closed";
+      } else if (strncmp(packetBuffer, "OPEN", 4) == 0) {
+        outPayload = "open";
+      }
     }
 
-    rtopic += dev;
-    const char* cContent = payloads.c_str();
-    const char* cTopic = rtopic.c_str();
-    client.publish(cTopic, cContent, mqtt_persistence);
+    char fullReplyTopic[64];
+    // Formatta direttamente il valore esadecimale di 'device' a 2 cifre (es. 0A)
+    snprintf(fullReplyTopic, sizeof(fullReplyTopic), "%s%02X", rtopicBase, device);
+    
+    client.publish(fullReplyTopic, outPayload, mqtt_persistence);
   }
 
 
@@ -2580,519 +1799,191 @@ void scanProcess()
 
 
 
-#ifdef MY_DOMOTIC
-
-
-/*
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-void reloadEntityOld(char firstload)
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-{
-// devtype: 1=SWITCH, 3=LIGHT, 4=LIGHT, 8=COVER, 11=GENERIC, 14=ALARM BOARD, 15=termostato, 18=COVER, 19=COVER PCT
-
-    WORD_VAL maxp;
-    maxp.Val = 0;
-
-    uint8_t device  = 0;
-    uint8_t devtype = 0;
-    uint8_t deviceX = 0;
-    char nomeDevice[6];
-    char AlexaDescr[21];
-
-    deviceX = 1;
-    tapparellePercentuale = false;
-
-    while (device_BUS_id[deviceX].addressW)
-    {
-      devtype = device_BUS_id[deviceX].deviceType;
-      if (device_BUS_id[deviceX].addressW)
-      {
-        device = DeviceOfIx(deviceX, nomeDevice);
-        String alexadescr = descrOfIx(deviceX);
-        alexadescr.toCharArray(AlexaDescr, 21);  
-        maxp.Val = 0;
-/*
-        if ((devtype == 9) || (devtype == 19))
-        {
-          requestBuffer[requestLen++] = PIC_REQ;
-          requestBuffer[requestLen++] = 'U';
-          requestBuffer[requestLen++] = '6';
-          requestBuffer[requestLen++] = device;
-          immediateSend();
-          char m = immediateReceive('[');
-          
-          if (m > 8)
-          {
-            maxp.Val = replyBuffer[2] | replyBuffer[1] << 8;
-          }
-          
-        }  // devtype == 9
-  */
- /*
-        switch(devtype)
-        {
-          case 1:  // SWITCH
-            aggiungiEntita(nomeDevice, AlexaDescr, ENTI_INTERRUTTORE, device, "OFF",0);
-            break;
-          case 3:  // DIMMER
-          case 4:
-            aggiungiEntita(nomeDevice, AlexaDescr, ENTI_SLIDER, device, "0",0);
-            break;
-          case 8:  // COVER
-          case 18:
-            aggiungiEntita(nomeDevice, AlexaDescr, ENTI_TAPPARELLA, device, "STOP",0);
-            break;
-          case 9:  // COVER PCT
-          case 19:
-            aggiungiEntita(nomeDevice, AlexaDescr, ENTI_TAPPARELLA_PCT, device, "0",0);
-            tapparellePercentuale = true;
-            break;
-          case 11:  // GENERIC
-            break;
-          case 14:  // ALARM
-            break;
-          case 15:  // TERMO
-            aggiungiEntita(nomeDevice, AlexaDescr, ENTI_SENSORE, device, "...",0);
-            break;
-        }
-//        sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",nomeDevice,devtype,maxp.Val,AlexaDescr);
-      } // devtype > 0
-      deviceX++;
-    } // while devicex < DEV_NR
-}
-*/
-
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-void reloadEntity(char firstload)
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-{
-
-Entita tempEntita[MY_ENTITA];
-/*
-struct Entita {
-    String id;
-    String nome;
-    TipoEntita tipo;
-    uint8_t pin;    // SCS address
-    String stato;
-    uint8_t valore;
-};
-*/
-int numeroTemp = 0;
-
-// devtype: 1=SWITCH, 3=LIGHT, 4=LIGHT, 8=COVER, 11=GENERIC, 14=ALARM BOARD, 15=termostato, 18=COVER, 19=COVER PCT
-
-    WORD_VAL maxp;
-    maxp.Val = 0;
-
-    uint8_t device  = 0;
-    uint8_t devtype = 0;
-    uint8_t deviceX = 0;
-    char nomeDevice[6];
-    char AlexaDescr[21];
-
-    deviceX = 1;
-    tapparellePercentuale = false;
-
-    while (device_BUS_id[deviceX].addressW)
-    {
-      devtype = device_BUS_id[deviceX].deviceType;
-      if (device_BUS_id[deviceX].addressW)
-      {
-        device = DeviceOfIx(deviceX, nomeDevice);
-        String alexadescr = descrOfIx(deviceX);
-        alexadescr.toCharArray(AlexaDescr, 21);  
-        maxp.Val = 0;
-/*
-        if ((devtype == 9) || (devtype == 19))
-        {
-          requestBuffer[requestLen++] = PIC_REQ;
-          requestBuffer[requestLen++] = 'U';
-          requestBuffer[requestLen++] = '6';
-          requestBuffer[requestLen++] = device;
-          immediateSend();
-          char m = immediateReceive('[');
-          
-          if (m > 8)
-          {
-            maxp.Val = replyBuffer[2] | replyBuffer[1] << 8;
-          }
-          
-        }  // devtype == 9
-  */
-        String stato = "";
-        uint8_t valore = 0;
-        for (int i=0; i< numeroEntita; i++)
-        {
-            if ((elencoEntita[i].id == nomeDevice)
-            &&  (corrispondenza[elencoEntita[i].tipo] == devtype))
-            {
-              stato = elencoEntita[i].stato;
-              valore = elencoEntita[i].valore;
-            }
-        }        
-
-        switch(devtype)
-        {
-          case 1:  // SWITCH
-            if (stato == "")  stato = "OFF";
-            tempEntita[numeroTemp] = {nomeDevice, AlexaDescr, ENTI_INTERRUTTORE, device, stato, valore};
-            break;
-          case 3:  // DIMMER
-          case 4:
-            if (stato == "")  stato = "OFF";
-            tempEntita[numeroTemp] = {nomeDevice, AlexaDescr, ENTI_SLIDER, device, stato, valore};
-            break;
-          case 8:  // COVER
-          case 18:
-            if (stato == "")  stato = "STOP";
-            tempEntita[numeroTemp] = {nomeDevice, AlexaDescr, ENTI_TAPPARELLA, device, stato, valore};
-            break;
-          case 9:  // COVER PCT
-          case 19:
-            if (stato == "")  stato = "STOP";
-            tempEntita[numeroTemp] = {nomeDevice, AlexaDescr, ENTI_TAPPARELLA_PCT, device, stato, valore};
-            tapparellePercentuale = true;
-            break;
-          case 11:  // GENERIC
-            break;
-          case 14:  // ALARM
-            break;
-          case 15:  // TERMO
-            if (stato == "")  stato = "...";
-            tempEntita[numeroTemp] = {nomeDevice, AlexaDescr, ENTI_SENSORE, device, stato, valore};
-            break;
-        }
-//        sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",nomeDevice,devtype,maxp.Val,AlexaDescr);
-        numeroTemp++;
-      } // devtype > 0
-      deviceX++;
-    } // while devicex < DEV_NR
-
-    numeroEntita = 0;
-    for (int i=0; i< numeroTemp; i++)
-    {
-      aggiungiEntita(tempEntita[i].id, tempEntita[i].nome, tempEntita[i].tipo, tempEntita[i].pin, tempEntita[i].stato, tempEntita[i].valore);
-    }        
-}
-
-
-#endif
 
 #ifdef MY_TABELLA
 
 // -----------------------------------------------------------------------------------------------------------------------------------------------
-void reloadDevices(void)
-// -----------------------------------------------------------------------------------------------------------------------------------------------
-{
-
-    conteggioElementi = 0;
-
-// devtype: 1=SWITCH, 3=LIGHT, 4=LIGHT, 8=COVER, 11=GENERIC, 14=ALARM BOARD, 15=termostato, 18=COVER, 19=COVER PCT
-//            LUC       DIM      DIM      TAP       GEN         ALA             TER            TAP       TAP 
-    WORD_VAL maxp;
-    maxp.Val = 0;
-
-    char device  = 0;
-    char devtype = 0;
-    char deviceX = 0;
-    char nomeDevice[6];
-    char AlexaDescr[21];
-
-    deviceX = 1;
-    while (device_BUS_id[deviceX].addressW)
-    {
-      devtype = device_BUS_id[deviceX].deviceType;
-      if (device_BUS_id[deviceX].addressW)
-      {
-        device = DeviceOfIx(deviceX, nomeDevice);
-        String alexadescr = descrOfIx(deviceX);
-        alexadescr.toCharArray(AlexaDescr, 21);  
-        maxp.Val = 0;
-        strcpy(lista[conteggioElementi].address, nomeDevice);
-        strcpy(lista[conteggioElementi].descrizione, AlexaDescr);
-        lista[conteggioElementi].valido = true;
-        sprintf(lista[conteggioElementi].tipo,"%02X", devtype);
-        strcpy(lista[conteggioElementi].valore, "0");
-        lista[conteggioElementi].bits.Val = 0;
-        switch(devtype)
-        {
-          case 1:  // SWITCH
-            strcpy(lista[conteggioElementi].tipo,"LUC");
-            break;
-          case 3:  // DIMMER
-          case 4:
-            strcpy(lista[conteggioElementi].tipo,"DIM");
-            break;
-          case 8:  // COVER
-          case 18:
-            strcpy(lista[conteggioElementi].tipo,"TAP");
-            break;
-          case 11:  // GENERIC
-            strcpy(lista[conteggioElementi].tipo,"GEN");
-            break;
-          case 14:  // ALARM
-            strcpy(lista[conteggioElementi].tipo,"ALA");
-            break;
-          case 15:  // TERMO
-            strcpy(lista[conteggioElementi].tipo,"TER");
-            break;
-          case 9:  // COVER PCT
-          case 19:
-            tapparellePercentuale = true;
-            strcpy(lista[conteggioElementi].tipo,"TAP");
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = 'U';
-            requestBuffer[requestLen++] = '6';
-            requestBuffer[requestLen++] = device;
-            immediateSend();
-            delay(5);
-            char m = immediateReceive('[');
-            if (m > 8)
-            {
-              maxp.Val = replyBuffer[2] | replyBuffer[1] << 8;
-            }
-            sprintf(lista[conteggioElementi].valore,"%d", maxp.Val);
-            break;
-      }
-      if (conteggioElementi<(MY_ENTITA - 1))
-      {
-        conteggioElementi++;
-        lista[conteggioElementi].valido = false;
-      }
-    } // while devicex < DEV_NR
-    deviceX++;
-  }
-}
-
-// -----------------------------------------------------------------------------------------------------------------------------------------------
 void uploadDevices(char loadAll)
+// bottone Aggiorna di /dispositivi
+//                  aggiorna il PIC e salva su NVS
 // -----------------------------------------------------------------------------------------------------------------------------------------------
 {
-
-//    int conteggioElementi = 0;
 
 // devtype: 1=SWITCH, 3=LIGHT, 4=LIGHT, 8=COVER, 11=GENERIC, 14=ALARM BOARD, 15=termostato, 18=COVER, 19=COVER PCT
 //            LUC       DIM      DIM      TAP       GEN         ALA             TER            TAP       TAP 
     WORD_VAL maxp;
     maxp.Val = 0;
-    char *ch;
 
-//    char busid  = 0;
-    char device  = 0;
-    char devtype = 0;
-    char deviceX = 0;
-
-    for(int i = 0; i < MY_ENTITA; i++) 
-    {
-      if (((!lista[i].valido) && (lista[i].bits.cancellata) && (!lista[i].bits.nuova) )
-      ||  ((lista[i].valido) && (lista[i].bits.chiave) && (!lista[i].bits.nuova)))
-      {
-          loadAll = 1;
-      }
-    }
-
-    if (loadAll == 1)
-// prima bisogna cancellare tutto
-    {
-      for(int i = 0; i < MY_ENTITA; i++) 
-      {
-        if ((!lista[i].valido) && (lista[i].bits.cancellata))
-            lista[i].bits.Val = 0;
-        else
-        if (lista[i].valido)
-        {
-          lista[i].bits.Val = 0;
-          lista[i].bits.nuova = 1;
-        }
-      }
-
-      if (tapparellePercentuale == false)
+    //      if (sistema_scs.tapparelle_percentuale == false)
       {
         requestBuffer[requestLen++] = PIC_REQ;
         requestBuffer[requestLen++] = 'U';
-        requestBuffer[requestLen++] = '9';
+        requestBuffer[requestLen++] = '9';  // pulisce tabella % su pic
         immediateSend();
         delay(300);
         immediateReceive('k');
         delay(100);
       }  // cover == "false"
 
-      for (int i = 0; i < DEV_NR; ++i)
-      {
-        EEPROM.write((int) i * E_ALEXA_DESC_LEN + E_ALEXA_DESC_DEVICE, 0);
-	      device_BUS_id[i].Val = 0;
-      }
-
-      WriteEEP((char) 0, (int) E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-      WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-//    EEPROM.commit();
 #ifdef DEBUG_EVENTITY
   char buflog[120];
   sprintf(buflog,"[%d] [CMD] clr ",(millis()/100));
   events.send(buflog, "log", millis());
 #endif
-    }
+//    }
 
 
 // **************************************************************************************************************
 
     for(int i = 0; i < MY_ENTITA; i++) 
     {
-/*
-    uint8_t Val;
-    struct
-    {
-        uint8_t cancellata:1;
-        uint8_t nuova:1;
-        uint8_t modificata:1;
-        uint8_t b3:1;
-        uint8_t chiave:1;
-        uint8_t tipo:1;
-        uint8_t descrizione:1;
-        uint8_t valore:1;
-    } bits;
-*/
-
-      if ((!lista[i].valido) && (lista[i].bits.cancellata))
+      if (sistema_scs.elenco[i].valido == 1)
       {
-        deviceX = ixOfDevice(&lista[i].address[0]);
-        if (deviceX)
-        {
-          device_BUS_id[deviceX].Val = 0;
-
-// la pulizia nel PIC e' gia' stata fatta          
-
-        }
-      }
-      else
-      if(lista[i].bits.nuova) 
-      {
-//DEVADDR device_BUS_id[DEV_NR]; // index:device index,  contenuto: device address reale (scs o knx) e tipo
-        deviceX = ixOfDeviceNew(&lista[i].address[0]);
-        device = device_BUS_id[deviceX].address;
-        if (deviceX)
-        {
-          device_BUS_id[deviceX].address = device; // (char)strtoul(lista[i].address, &ch, 16);
-          device_BUS_id[deviceX].alexa_id = 0;        // rivedere
-          if (strcmp(lista[i].tipo, "LUC") == 0)
-              device_BUS_id[deviceX].deviceType = 1;
-          else 
-          if (strcmp(lista[i].tipo, "DIM") == 0)
-              device_BUS_id[deviceX].deviceType = 3;
-          else 
-          if (strcmp(lista[i].tipo, "GEN") == 0)
-              device_BUS_id[deviceX].deviceType = 11;
-          else 
-          if (strcmp(lista[i].tipo, "ALA") == 0)
-              device_BUS_id[deviceX].deviceType = 14;
-          else 
-          if (strcmp(lista[i].tipo, "TER") == 0)
-              device_BUS_id[deviceX].deviceType = 15;
-          else 
-          if (strcmp(lista[i].tipo, "TAP") == 0)
+          if ((sistema_scs.elenco[i].tipo_codice == TAPPARELLA) || (sistema_scs.elenco[i].tipo_codice == TAPPARELLA_PCT))
           {
-              if (tapparellePercentuale == false)
-                  device_BUS_id[deviceX].deviceType = 8;
+              if (sistema_scs.tapparelle_percentuale == false)
+                  sistema_scs.elenco[i].tipo_codice = TAPPARELLA;
               else
               {
-                  device_BUS_id[deviceX].deviceType = 9;
+                  sistema_scs.elenco[i].tipo_codice = TAPPARELLA_PCT;
                   char *ch;
-                  maxp.Val = (int)strtoul(lista[i].valore, &ch, 10);
+                  maxp.Val = (int)strtoul(sistema_scs.elenco[i].valore_max, &ch, 10);
                   requestBuffer[requestLen++] = PIC_REQ;
                   requestBuffer[requestLen++] = 'U';
-                  requestBuffer[requestLen++] = '8';
-                  requestBuffer[requestLen++] = device;     // device id
-                  requestBuffer[requestLen++] = device_BUS_id[deviceX].deviceType;    // device type
+                  requestBuffer[requestLen++] = '8';        // tapparella pct
+                  requestBuffer[requestLen++] = sistema_scs.elenco[i].id;     // device id
+                  requestBuffer[requestLen++] = sistema_scs.elenco[i].tipo_codice;    // device type
                   requestBuffer[requestLen++] = maxp.byte.HB;    // max position H
                   requestBuffer[requestLen++] = maxp.byte.LB;    // max position L
                   immediateSend();
                   immediateReceive('k');
                   delay(50);
               }
-            }
-            WriteDescrOfIx(lista[i].descrizione, deviceX);
           }
+      }
 #ifdef DEBUG_EVENTITY
   char buflog[120];
-  sprintf(buflog,"[%d] [CMD] new: %s %s %s : %02X, %d, [%d]",(millis()/100), lista[i].address, lista[i].tipo, lista[i].descrizione, device,device_BUS_id[deviceX].deviceType,deviceX);
+  sprintf(buflog,"[%d] [CMD] new: %s %s %s : %02X, [%d]",(millis()/100), sistema_scs.elenco[i].address, sistema_scs.elenco[i].tipo_codice, sistema_scs.elenco[i].descrizione, i);
   events.send(buflog, "log", millis());
 #endif
-      }
-      else
-      if(lista[i].bits.modificata) 
-      {
-  //DEVADDR device_BUS_id[DEV_NR]; // index:device index,  contenuto: device address reale (scs o knx) e tipo
-          deviceX = ixOfDeviceNew(&lista[i].address[0]);
-          device = device_BUS_id[deviceX].address;
-          if (deviceX)
-          {
-  //          device_BUS_id[deviceX].address = device; // (char)strtoul(lista[i].address, &ch, 16);
-  //          device_BUS_id[deviceX].alexa_id = 0;        // rivedere
-            if (strcmp(lista[i].tipo, "LUC") == 0)
-                device_BUS_id[deviceX].deviceType = 1;
-            else 
-            if (strcmp(lista[i].tipo, "DIM") == 0)
-                device_BUS_id[deviceX].deviceType = 3;
-            else 
-            if (strcmp(lista[i].tipo, "GEN") == 0)
-                device_BUS_id[deviceX].deviceType = 11;
-            else 
-            if (strcmp(lista[i].tipo, "ALA") == 0)
-                device_BUS_id[deviceX].deviceType = 14;
-            else 
-            if (strcmp(lista[i].tipo, "TER") == 0)
-                device_BUS_id[deviceX].deviceType = 15;
-            else 
-            if (strcmp(lista[i].tipo, "TAP") == 0)
-            {
-                if (tapparellePercentuale == false)
-                    device_BUS_id[deviceX].deviceType = 8;
-                else
-                if (strcmp(lista[i].tipo, "TAP") == 0)
-                {
-                    if (tapparellePercentuale == false)
-                        device_BUS_id[deviceX].deviceType = 8;
-                    else
-                    {
-                        device_BUS_id[deviceX].deviceType = 9;
-                        if(lista[i].bits.valore)
-                        { 
-                          char *ch;
-                          maxp.Val = (int)strtoul(lista[i].valore, &ch, 10);
-                          requestBuffer[requestLen++] = PIC_REQ;
-                          requestBuffer[requestLen++] = 'U';
-                          requestBuffer[requestLen++] = '8';
-                          requestBuffer[requestLen++] = device;     // device id
-                          requestBuffer[requestLen++] = device_BUS_id[deviceX].deviceType;    // device type
-                          requestBuffer[requestLen++] = maxp.byte.HB;    // max position H
-                          requestBuffer[requestLen++] = maxp.byte.LB;    // max position L
-                          immediateSend();
-                          immediateReceive('k');
-                          delay(50);
-                        }
-                    }
-                }
-            }
-         else 
-            device_BUS_id[deviceX].deviceType = 1;
-            if(lista[i].bits.descrizione) 
-              WriteDescrOfIx(lista[i].descrizione, deviceX);
-          }
-#ifdef DEBUG_EVENTITY
-  char buflog[120];
-  sprintf(buflog,"[%d] [CMD] agg: %s %s %s : %02X, %d, [%d]",(millis()/100), lista[i].address, lista[i].tipo, lista[i].descrizione, device,device_BUS_id[deviceX].deviceType,deviceX);
-  events.send(buflog, "log", millis());
+    }
+    rigenera_tabella_indice();
+    salva_dispositivi_preferences();
+}
 #endif
 
-      }
+
+
+// -----------------------------------------------------------------------------------------------------------------------------------------------
+int rimuovi_spazi_string(String &str) {
+    int len = 0;
+    int src = 0;
+    int dst = 0;
+    int str_len = str.length();
+
+    while (src < str_len) {
+        // Se incontra '%', salta i due caratteri successivi (mantenendo la tua logica C)
+        if (str[src] == '%') {
+            src += 3; // Salta il '%' e i successivi 2 caratteri
+            continue;
+        }
+        
+        if (str[src] != ' ') {
+            str[dst] = str[src];
+            dst++;
+            len++;
+        }
+        src++;
+    }
+    
+    // Ridimensiona la stringa per tagliare la parte rimanente vecchia
+    str.remove(dst); 
+    return len;
+}
+// -----------------------------------------------------------------------------------------------------------------------------------------------
+
+// =====================================================================================================
+// =====================================================================================================
+/*
+WiFi.begin(ssid, password);
+
+// Scegli una delle seguenti opzioni prima che il Wi-Fi completi la connessione:
+Serial.printf("Potenza Wi-Fi attuale: %.2f dBm\n", TxPower * 0.25);
+TxPower 
+WiFi.setTxPower(WIFI_POWER_15dBm);  // 15 dBm (Consigliato standard)
+WiFi.setTxPower(WIFI_POWER_13dBm);  // 13 dBm (Ottimo intermedio)
+WiFi.setTxPower(WIFI_POWER_11dBm);  // 11 dBm (Bilanciato per micro-schede)
+WiFi.setTxPower(WIFI_POWER_8_5dBm); // 8.5 dBm (Massima stabilità/basso consumo)
+*/
+
+
+void gestisciPotenzaDinamica(uint8_t force=0) {
+  // Gestione del timer basata sui cicli di chiamata (presuppone loop di 1 secondo)
+  if ((ctrPotenza++ < 30) && (force == 0)) 
+      return;
+  ctrPotenza = 0;
+
+  if (force)
+      forcePower = force;
+  else
+  if (forcePower)
+      force = forcePower;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // Se forziamo manualmente, simuliamo un RSSI neutro per non interferire con i blocchi successivi
+    long rssi = (force > 0) ? -70 : WiFi.RSSI(); 
+    wifi_power_t nuovaPotenza = TxPower;
+
+
+    // LOGICA DI CONTROLLO CON TETTO MASSIMO A 13 dBm
+    if ((rssi < -75) || (force == 3)) {
+      // Anche con segnale debole, NON superiamo i 13 dBm per evitare auto-interferenze termiche/radio
+      nuovaPotenza = WIFI_POWER_13dBm; 
+    }
+    else if ((rssi >= -75 && rssi <= -55) || (force == 2)) {
+      // Segnale intermedio/buono: 11 dBm è il punto di massima stabilità
+      nuovaPotenza = WIFI_POWER_11dBm;
+    }
+    else if ((rssi > -55) || (force == 1)) {
+      // Segnale eccellente: scendiamo a 8.5 dBm
+      nuovaPotenza = WIFI_POWER_8_5dBm;
     }
 
 
-
-
+    // Applica il cambio solo se la potenza calcolata è DIVERSA da quella attuale
+    if (nuovaPotenza != TxPower) {
+      TxPower = nuovaPotenza;
+      WiFi.setTxPower(TxPower);
+//      Serial.printf("[Wi-Fi] TX Power aggiornato a: %.2f dBm (RSSI: %ld)\n", TxPower * 0.25, rssi);
+    }
+  }
 }
-#endif
+
+// -----------------------------------------------------------------------------------------------------------------------------------------------
+
+String getWiFiAuthMode() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return "Non connesso";
+  }
+
+  wifi_ap_record_t ap_info;
+  if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+    switch (ap_info.authmode) {
+      case WIFI_AUTH_OPEN:            return "OPEN";
+      case WIFI_AUTH_WEP:             return "WEP";
+      case WIFI_AUTH_WPA_PSK:         return "WPA-PSK";
+      case WIFI_AUTH_WPA2_PSK:        return "WPA2-PSK";
+      case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2-PSK";
+      case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-Enterprise";
+      case WIFI_AUTH_WPA3_PSK:        return "WPA3-SAE";
+      case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3-PSK";
+      case WIFI_AUTH_WAPI_PSK:        return "WAPI-PSK";
+      default:                        return "Sconosciuto (" + String(ap_info.authmode) + ")";
+    }
+  }
+  return "Errore lettura AP";
+}
+
 // -----------------------------------------------------------------------------------------------------------------------------------------------
 void createWebServer(int webtype)
 // -----------------------------------------------------------------------------------------------------------------------------------------------
@@ -3103,28 +1994,57 @@ void createWebServer(int webtype)
   {
 
 #ifdef MY_TABELLA
-      reloadDevices();
-
     // Servizio Pagina Principale HTML
     a_server.on("/dispositivi", HTTP_GET, [](AsyncWebServerRequest *request){
       request->send(200, "text/html", index_html_TAB);
     });
 
       // API per inviare la lista in formato CSV (senza JSON)
-    a_server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request){
 
-        String output = "";
-        for(int i = 0; i < MY_ENTITA; i++) {
-          if(lista[i].valido) {
-            output += String(i) + "," + 
-                      String(lista[i].address) + "," + 
-                      String(lista[i].tipo) + "," + 
-                      String(lista[i].descrizione) + "," + 
-                      String(lista[i].valore) + "\n";
-          }
+a_server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
+    
+    // Avviamo una risposta in streaming a piccoli pezzi (chunk) per salvaguardare la RAM
+    AsyncWebServerResponse *response = request->beginChunkedResponse("text/plain", [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        
+        // Indice statico per mantenere la posizione del ciclo tra le varie chiamate del server
+        static int i_disp = 0;
+
+        // Se index è 0 significa che è una nuova richiesta HTTP: azzeriamo il contatore
+        if (index == 0) {
+            i_disp = 0;
         }
-        request->send(200, "text/plain", output);
-      });
+
+        String chunk = "";
+
+        // Cicla l'elenco dei dispositivi finché c'è spazio nel buffer di rete corrente
+        while (i_disp < MY_ENTITA && chunk.length() < (maxLen - 128)) {
+            
+            // Filtro: processa solo gli slot realmente occupati
+            if ((sistema_scs.elenco[i_disp].id != 0) && (sistema_scs.elenco[i_disp].valido == 1)) {
+                
+				String tipo_str = codifica_codice_a_tipo(sistema_scs.elenco[i_disp].tipo_codice, 1); 
+                // Costruisce la riga CSV identica a prima: id,address,tipo,descrizione,valore
+                chunk += String(i_disp) + "," + 
+                         String(sistema_scs.elenco[i_disp].address) + "," + 
+                         tipo_str + "," + 
+                         String(sistema_scs.elenco[i_disp].descrizione) + "," + 
+                         String(sistema_scs.elenco[i_disp].valore_max) + "\n";
+            }
+            i_disp++;
+        }
+
+        // Se ci sono dati nel chunk attuale, copiali nel buffer dell'interfaccia di rete
+        if (chunk.length() > 0) {
+            memcpy(buffer, chunk.c_str(), chunk.length());
+            return chunk.length();
+        }
+
+        return 0; // Fine dello streaming dei dati CSV
+    });
+
+    request->send(response);
+});
+
 
       // Ricezione dati tramite POST Form standard e salvataggio in RAM
     a_server.on("/add", HTTP_POST, [](AsyncWebServerRequest *request){
@@ -3144,140 +2064,139 @@ void createWebServer(int webtype)
       // 2. CONTROLLO UNICITÀ DELL'ADDRESS
       // Cerchiamo se l'indirizzo inserito esiste già in memoria
       for(int i = 0; i < MY_ENTITA; i++) {
-        if(lista[i].valido && addr.equals(String(lista[i].address))) {
+        if ((sistema_scs.elenco[i].valido == 1) && addr.equals(String(sistema_scs.elenco[i].address))) {
           // Se stiamo inserendo un NUOVO elemento, blocca subito l'azione
           // Se stiamo MODIFICANDO, blocca solo se il duplicato si trova in uno slot DIVERSO da quello che stiamo modificando
+
           if(idModifica == -1 || idModifica != i) {
-            request->send(400, "text/plain", "Errore: L'indirizzo (Address) inserito e' gia' presente in lista!");
+			request->send(400, "text/plain", "L'indirizzo (Address) inserito è già presente in lista!");
             return;
           }
         }
-      }
-/*
-    uint8_t Val;
-    struct
-    {
-        uint8_t cancellata:1;
-        uint8_t nuova:1;
-        uint8_t modificata:1;
-        uint8_t b3:1;
-        uint8_t chiave:1;
-        uint8_t tipo:1;
-        uint8_t descrizione:1;
-        uint8_t valore:1;
-    } bits;
-*/
+      } // end for
+
       // 3. DETERMINAZIONE DELLO SLOT DI DESTINAZIONE
       if (idModifica == -1) 
       {
         // NUOVO INSERIMENTO
-        if(conteggioElementi >= MY_ENTITA) {
-          request->send(400, "text/plain", "Errore: Lista piena (Max 50 elementi)");
-          return;
-        }
+//        if(conteggioElementi >= MY_ENTITA) {
+//			request->send(400, "text/plain", "ID non valido o spazio in memoria esaurito (Max 128 dispositivi).");
+//			return;
+//        }
+
         // Trova il primo slot vuoto
         for(int i = 0; i < MY_ENTITA; i++) 
         {
-          if(!lista[i].valido) 
+          if(sistema_scs.elenco[i].valido == 0) 
           {
             targetSlot = i;
-            lista[targetSlot].bits.Val = 0;
-            lista[targetSlot].bits.nuova = 1;  // <-----------------------------------
             break;
           }
-        }
-      } else {
+        } // end for
+      } else {	// else idModifica
         // MODIFICA DI UN ELEMENTO ESISTENTE
-        if (idModifica >= 0 && idModifica < MY_ENTITA && lista[idModifica].valido) {
+        if (idModifica >= 0 && idModifica < MY_ENTITA && (sistema_scs.elenco[idModifica].valido == 1)) {
+
           targetSlot = idModifica;            // <-----------------------------------
-          lista[targetSlot].bits.modificata = 1;
+          sistema_scs.elenco[targetSlot].bits.modificata = 1;
+          uint8_t addr_num = sistema_scs.elenco[targetSlot].id;
+          // Toglie la posizione i dell'array a quel byte indice
+          tabella_indice[addr_num].pointer = -1;
         }
-      }
+      } // end idModifica
+
+
 
       // 4. SALVATAGGIO DEI DATI IN RAM
       if(targetSlot != -1) {
-        char temp[22];
-        // Copia protetta nei buffer di array di caratteri (C-strings)
+        char temp[28];
+
+		// Copia protetta nei buffer di array di caratteri (C-strings)
 
         strncpy(temp,addr.c_str(), 2);
         temp[2] = '\0'; // Garantisce la terminazione corretta del buffer di 3 byte
-        if (strcmp(lista[targetSlot].address, temp) != 0)
+        
+        uint8_t addr_num = (uint8_t)strtol(temp, NULL, 16);
+        sistema_scs.elenco[targetSlot].id = addr_num; // address
+
+        // Aggiunge la posizione i dell'array a quel byte indice
+        tabella_indice[addr_num].pointer = targetSlot;
+        if (strcmp(sistema_scs.elenco[targetSlot].address, temp) != 0)
         {
-            lista[targetSlot].bits.chiave = 1;
-            strcpy(lista[targetSlot].address, temp);
+            sistema_scs.elenco[targetSlot].bits.chiave = 1;
+            strcpy(sistema_scs.elenco[targetSlot].address, temp);
         }
 
         strncpy(temp,tipo.c_str(), 3);
         temp[3] = '\0'; // Garantisce la terminazione corretta del buffer
-        if (strcmp(lista[targetSlot].address, temp) != 0)
+        if (sistema_scs.elenco[targetSlot].tipo_codice != decodifica_tipo_a_codice(temp,sistema_scs.tapparelle_percentuale));
         {
-            lista[targetSlot].bits.tipo = 1;
-            strcpy(lista[targetSlot].tipo, temp);
+            sistema_scs.elenco[targetSlot].bits.tipo = 1;
+            sistema_scs.elenco[targetSlot].tipo_codice = decodifica_tipo_a_codice(temp,sistema_scs.tapparelle_percentuale);
         }
 
-        strncpy(temp,desc.c_str(), 20);
-        temp[20] = '\0'; // Garantisce la terminazione corretta del buffer
-        if (strcmp(lista[targetSlot].descrizione, temp) != 0)
+        strncpy(temp,desc.c_str(), 25);
+        temp[25] = '\0'; // Garantisce la terminazione corretta del buffer
+        if (strcmp(sistema_scs.elenco[targetSlot].descrizione, temp) != 0)
         {
-            lista[targetSlot].bits.descrizione = 1;
-            strcpy(lista[targetSlot].descrizione, temp);
+            sistema_scs.elenco[targetSlot].bits.descrizione = 1;
+            strcpy(sistema_scs.elenco[targetSlot].descrizione, temp);
         }
 
         strncpy(temp,val.c_str(), 3);
         temp[3] = '\0'; // Garantisce la terminazione corretta del buffer
-        if (strcmp(lista[targetSlot].valore, temp) != 0)
+        if (strcmp(sistema_scs.elenco[targetSlot].valore_max, temp) != 0)
         {
-            lista[targetSlot].bits.valore = 1;
-            strcpy(lista[targetSlot].valore, temp);
+            sistema_scs.elenco[targetSlot].bits.valore = 1;
+            strcpy(sistema_scs.elenco[targetSlot].valore_max, temp);
         }
+      
+        if (idModifica == -1)   // nuovo
+            set_device_default(targetSlot, 1);
 
-/*
-        strncpy(lista[targetSlot].address, addr.c_str(), 2);
-        lista[targetSlot].address[2] = '\0'; // Garantisce la terminazione corretta del buffer di 3 byte
 
-        strncpy(lista[targetSlot].tipo, tipo.c_str(), 3);
-        lista[targetSlot].tipo[3] = '\0';
-
-        strncpy(lista[targetSlot].descrizione, desc.c_str(), 20);
-        lista[targetSlot].descrizione[20] = '\0';
-
-        strncpy(lista[targetSlot].valore, val.c_str(), 3);
-        lista[targetSlot].valore[3] = '\0';
-*/
-        // Se era un nuovo elemento incrementa il contatore, se era una modifica resta invariato
-        if (!lista[targetSlot].valido) {
-          lista[targetSlot].valido = true;
-          conteggioElementi++;
-        }
 #ifdef DEBUG_EVENTITY
   char buflog[120];
   char binlog[9];
-  for (unsigned i = 0; i < 8; ++i) binlog[i] = 0x30 | ((lista[targetSlot].bits.Val >> (7 - i)) & 0x01);
+  for (unsigned i = 0; i < 8; ++i) binlog[i] = 0x30 | ((sistema_scs.elenco[targetSlot].bits.Val >> (7 - i)) & 0x01);
   binlog[8] = 0;
-  sprintf(buflog,"[%d] [CMD] xxx: %s %s %s : 0b%s, [%d]",conteggioElementi, lista[targetSlot].address, lista[targetSlot].tipo, lista[targetSlot].descrizione, binlog, targetSlot);
+  sprintf(buflog,"[%d] [CMD] xxx: %s %s %s : 0b%s, [%d]",targetSlot, sistema_scs.elenco[targetSlot].address, sistema_scs.elenco[targetSlot].tipo, sistema_scs.elenco[targetSlot].descrizione, binlog, targetSlot);
   events.send(buflog, "log", millis());
 #endif
         
         request->redirect("/dispositivi");
-      } else {
-        request->send(400, "text/plain", "Errore: ID non valido o slot non allocabile.");
-      }
+      } else {  //  // else targeSlot SALVATAGGIO IN RAM
+
+//        request->send(400, "text/plain", "Errore: ID non valido o slot non allocabile.");
+
+		  String htmlErrore = "<html><head><script>"
+							  "alert('Errore: ID non valido o slot non allocabile.');"
+							  "window.history.back();"
+							  "</script></head><body></body></html>";
+		  request->send(200, "text/html", htmlErrore);	  
+	  
+	  }
     });
 
       // Cancellazione di un elemento tramite ID (Indice dell'array)
     a_server.on("/delete", HTTP_POST, [](AsyncWebServerRequest *request){
         if(request->hasParam("id")) {
-          int id = request->getParam("id")->value().toInt();
-          if(id >= 0 && id < MY_ENTITA && lista[id].valido) {
-            lista[id].valido = false;
-            lista[id].bits.cancellata = 1;
-            conteggioElementi--;
+          int i_disp = request->getParam("id")->value().toInt();
+
+          if(i_disp >= 0 && i_disp < MY_ENTITA && (sistema_scs.elenco[i_disp].valido == 1)) {
+            sistema_scs.elenco[i_disp].valido = 0;
+            sistema_scs.elenco[i_disp].bits.cancellata = 1;
+///			rigenera_tabella_indice();
+            uint8_t addr_num = sistema_scs.elenco[i_disp].id;
+            // Toglie la posizione i dell'array a quel byte indice
+            tabella_indice[addr_num].pointer = -1;
+
 #ifdef DEBUG_EVENTITY
     char buflog[120];
     char binlog[9];
-    for (unsigned i = 0; i < 8; ++i) binlog[i] = 0x30 | ((lista[id].bits.Val >> (7 - i)) & 0x01);
+    for (unsigned i = 0; i < 8; ++i) binlog[i] = 0x30 | ((sistema_scs.elenco[i_disp].bits.Val >> (7 - i)) & 0x01);
     binlog[8] = 0;
-    sprintf(buflog,"[%d] [CMD] dxx: %s %s %s : 0b%s, [%d]",conteggioElementi, lista[id].address, lista[id].tipo, lista[id].descrizione, binlog, id);
+    sprintf(buflog,"[%d] [CMD] dxx: %s %s %s : 0b%s, [%d]",id, sistema_scs.elenco[id].address, sistema_scs.elenco[id].tipo, sistema_scs.elenco[id].descrizione, binlog, id);
     events.send(buflog, "log", millis());
 #endif
             request->send(200, "text/plain", "OK");
@@ -3293,18 +2212,10 @@ void createWebServer(int webtype)
     // Legge il parametro inviato in input dall'URL della richiesta POST
     if(request->hasParam("tapparelle")) {
       String val = request->getParam("tapparelle")->value();
-      bool newtapparellePercentuale = (val == "1");
-      if (tapparellePercentuale == newtapparellePercentuale)
-      {
-        uploadDevices(0);
-      }
-      else
-      {
-        tapparellePercentuale = newtapparellePercentuale;
-        uploadDevices(1);
-      }
+      sistema_scs.tapparelle_percentuale = (val == "1");
+      uploadDevices(sistema_scs.tapparelle_percentuale);
 
-//      Serial.printf("Pulsante Memorizza premuto. Stato checkbox ricevuto: %s\n", tapparellePercentuale ? "ATTIVO" : "DISATTIVO");
+   //      Serial.printf("Pulsante Memorizza premuto. Stato checkbox ricevuto: %s\n", sistema_scs.tapparelle_percentuale ? "ATTIVO" : "DISATTIVO");
 
       flagRefreshDevices = 1;
     }
@@ -3315,7 +2226,7 @@ void createWebServer(int webtype)
 
   // Endpoint per dire al browser se la checkbox deve essere attiva o no
   a_server.on("/get-config", HTTP_GET, [](AsyncWebServerRequest *request){
-    String stato = tapparellePercentuale ? "1" : "0";
+    String stato = sistema_scs.tapparelle_percentuale ? "1" : "0";
     request->send(200, "text/plain", stato);
   });
 
@@ -3325,19 +2236,131 @@ void createWebServer(int webtype)
 
 #ifdef MY_DOMOTIC
 
-    reloadEntity(1);
-
     a_server.on("/sseha", HTTP_GET, [](AsyncWebServerRequest *request){
-        reloadEntity(0);
         request->send(200, "text/html", index_html_HA);
     });
 
 
 
-   // 2. Endpoint JSON che JavaScript leggerà all'avvio per montare la pagina
-    a_server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(200, "application/json", generaConfigurazioneJSON());
+a_server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest *request) {
+    
+    // Creiamo una risposta in streaming con Content-Type JSON
+    AsyncWebServerResponse *response = request->beginChunkedResponse("application/json", [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        
+        // Struttura statica per tracciare lo stato dell'invio tra un chunk e l'altro
+        static int fase = 0; // 0 = Inizio, 1 = Dispositivi, 2 = Info, 3 = Fine
+        static int i_entita = 0;
+        static int i_info = 0;
+
+        // Se l'indice è 0, resettiamo i contatori per una nuova richiesta HTTP
+        if (index == 0) {
+            fase = 0;
+            i_entita = 0;
+            i_info = 0;
+        }
+
+        String chunk = "";
+
+        // FASE 0: Inizio del JSON
+        if (fase == 0) {
+            chunk += "[";
+            fase = 1; // Passa alla scansione dei dispositivi
+        }
+
+        // FASE 1: Invio dei dispositivi (Adattato alla tua nuova struttura 'sistema_scs.elenco')
+        if (fase == 1) {
+            while (i_entita < MY_ENTITA && chunk.length() < (maxLen - 256)) {
+                // Filtro: invia solo i dispositivi validi/censiti
+                if ((sistema_scs.elenco[i_entita].id != 0) && (sistema_scs.elenco[i_entita].valido == 1) 
+                && (sistema_scs.elenco[i_entita].tipo_codice != GENERICO) && (sistema_scs.elenco[i_entita].tipo_codice != ALLARME))
+                {    
+                    if (i_entita > 0 || index > 1) chunk += ",";
+                    int8_t hwtype = tipo_to_hwType(sistema_scs.elenco[i_entita].tipo_codice);
+                    chunk += "{";
+                    chunk += "\"id\":\"" + String(sistema_scs.elenco[i_entita].address) + "\",";
+                    chunk += "\"nome\":\"" + String(sistema_scs.elenco[i_entita].descrizione) + "\",";
+                    chunk += "\"tipo\":" + String(hwtype) + ",";
+                    
+                    if (hwtype == ENTI_TAPPARELLA_PCT) { 
+                        chunk += "\"stato\":\"" + String(sistema_scs.elenco[i_entita].valore_corrente) + "|" + String(sistema_scs.elenco[i_entita].stato) + "\"";
+                    } else if (hwtype == ENTI_SLIDER) { 
+                        chunk += "\"stato\":\"" + String(sistema_scs.elenco[i_entita].stato) + "|" + String(sistema_scs.elenco[i_entita].valore_corrente) + "\"";
+                    } else {
+                        chunk += "\"stato\":\"" + String(sistema_scs.elenco[i_entita].stato) + "\"";
+                    }
+                    chunk += "}";
+                }
+                i_entita++;
+            }
+            
+            if (i_entita >= MY_ENTITA) {
+                fase = 2; // Dispositivi finiti, passa alle Info
+            }
+        }
+
+        // FASE 2: Invio delle Card Info (Adattato a 'sistema_scs.cardinfo')
+        if (fase == 2) {
+            while (i_info < numeroInfo && chunk.length() < (maxLen - 256)) {
+                if (cardinfo[i_info].id != -1) {
+                    
+                    // Aggiunge la virgola se abbiamo già inviato qualcosa (o dispositivi o info precedenti)
+                    chunk += ",";
+
+                    char info_combinato[128] = {0};
+                    snprintf(info_combinato, sizeof(info_combinato), "%s|%s|%s|%s|%s",
+                             cardinfo[i_info].info_0, 
+                             cardinfo[i_info].info_1, 
+                             cardinfo[i_info].info_2, 
+                             cardinfo[i_info].info_3,
+                             cardinfo[i_info].info_4);
+
+                    // Trova l'indice del dispositivo associato per prenderne il nome
+//                    int p_id = sistema_scs.cardinfo[i_info].id;
+                    int p_id = cardinfo[i_info].id;
+                    String nome_disp = "Info";
+                    nome_disp += String(sistema_scs.elenco[p_id].descrizione);
+                    String id_disp = String(sistema_scs.elenco[p_id].address);
+
+                    chunk += "{";
+                    chunk += "\"id\":\"" + id_disp + "_INF\",";
+                    chunk += "\"nome\":\"" + nome_disp + " (info)\",";
+                    chunk += "\"tipo\":5,";
+                    chunk += "\"stato\":\"" + String(info_combinato) + "\"";
+                    chunk += "}";
+                }
+                i_info++;
+            }
+            
+            if (i_info >= numeroInfo) {
+                fase = 3; // Info finite, chiudi l'array
+            }
+        }
+
+        // FASE 3: Chiusura finale del JSON
+        if (fase == 3) {
+            chunk += "]";
+            fase = 4; // Fine della trasmissione
+// mio log
+//          events.send(chunk.c_str(), "log", millis());
+        }
+
+        // Copia il chunk generato nel buffer di rete dell'ESP32
+        if (chunk.length() > 0) {
+            memcpy(buffer, chunk.c_str(), chunk.length());
+            return chunk.length();
+        }
+
+        return 0; // Trasmissione completata con successo
     });
+
+    request->send(response);
+});
+
+
+
+
+
+
 
     // 3. Endpoint API universale per i pulsanti
     a_server.on("/api/toggle", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -3347,16 +2370,24 @@ void createWebServer(int webtype)
             unsigned char command = 0;
             unsigned char device = 0;
             String idRichiesto = request->getParam("id")->value();
-            for (int i = 0; i < numeroEntita; i++) {
-                if ((elencoEntita[i].id == idRichiesto) && 
-                    (elencoEntita[i].tipo == ENTI_INTERRUTTORE) || (elencoEntita[i].tipo == ENTI_SLIDER)) 
+
+            uint8_t i = CercaAddress(idRichiesto.c_str());
+            if (i != 0xFF)   
+            {
+//                if ((sistema_scs.elenco[i].id == idRichiesto) && 
+                if  ((tipo_to_hwType(sistema_scs.elenco[i].tipo_codice) == ENTI_INTERRUTTORE) || (tipo_to_hwType(sistema_scs.elenco[i].tipo_codice) == ENTI_SLIDER))
                 {
 
                   // Toggle dello stato dell'entità - comando SCS <******************************************************+
 
-                    elencoEntita[i].stato = (elencoEntita[i].stato == "ON") ? "OFF" : "ON";
-                    device = elencoEntita[i].pin;
-                    if (elencoEntita[i].stato == "ON")
+                    if (strcmp(sistema_scs.elenco[i].stato, "ON") == 0) {
+                        strcpy(sistema_scs.elenco[i].stato, "OFF");
+                    } else {
+                        strcpy(sistema_scs.elenco[i].stato, "ON");
+                    }
+                    
+                    device = (uint8_t)strtol(sistema_scs.elenco[i].address, NULL, 16);
+                    if (strcmp(sistema_scs.elenco[i].stato, "ON") == 0)
                       command = 0x00;
                     else 
                       command = 0x01;
@@ -3369,8 +2400,7 @@ void createWebServer(int webtype)
                     requestBuffer[requestLen++] = command;// command
 
                     // Notifica SSE usando l'ID entità come evento
-                    eventity.send(elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-                    break;
+                    eventity.send(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address, millis());
                 }
             }
             request->send(200, "text/plain", "OK");
@@ -3378,6 +2408,8 @@ void createWebServer(int webtype)
             request->send(400, "text/plain", "Bad Request");
         }
     });
+
+
 
     // LIGHT_SET
     // 3. Endpoint API universale per i dimmer (slider)
@@ -3388,15 +2420,16 @@ void createWebServer(int webtype)
           unsigned char command = 0;
           unsigned char device = 0;
           
-          for (int i = 0; i < numeroEntita; i++) {
-              if (elencoEntita[i].id == idRichiesto && elencoEntita[i].tipo == ENTI_SLIDER) {
-                  device = elencoEntita[i].pin;
-//                  elencoEntita[i].stato = valoreRicevuto;
+          uint8_t i = CercaAddress(idRichiesto.c_str());
+          if (i != 0xFF)   
+          {
+			  if  ((tipo_to_hwType(sistema_scs.elenco[i].tipo_codice) == ENTI_SLIDER)) {
+                  device = (uint8_t)strtol(sistema_scs.elenco[i].address, NULL, 16);
                   
                 // comando SCS <******************************************************+
                   command = 0x00;  // on/up
                   int pct = valoreRicevuto.toInt();    // percentuale
-                  elencoEntita[i].valore = pct;
+                  strcpy(sistema_scs.elenco[i].valore_corrente, valoreRicevuto.c_str());
                 // --------------- percentuale da 1 a 255 (home assistant) -----------
         //        if ((domoticMode == 'h') || (domoticMode == 'H'))   // h=as homeassistant
         //        { // percentuale 0-255
@@ -3422,8 +2455,7 @@ void createWebServer(int webtype)
                   requestBuffer[requestLen++] = command;// command
 
                   // Notifica istantaneamente via SSE tutti gli altri browser connessi
-                  eventity.send(String(elencoEntita[i].valore) + elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-                  break;
+                  eventity.send(String(sistema_scs.elenco[i].valore_corrente) + sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address, millis());
               }
           }
           request->send(200, "text/plain", "OK");
@@ -3441,22 +2473,25 @@ void createWebServer(int webtype)
         unsigned char command = 0;
         unsigned char device = 0;
         
-        for (int i = 0; i < numeroEntita; i++) {
-            if (elencoEntita[i].id == idRichiesto && elencoEntita[i].tipo == ENTI_TAPPARELLA) {
-                device = elencoEntita[i].pin;
-                if (comando == "SALITA") //  && elencoEntita[i].pin != -1) 
+        uint8_t i = CercaAddress(idRichiesto.c_str());
+        if (i != 0xFF)   
+        {
+			  if  ((tipo_to_hwType(sistema_scs.elenco[i].tipo_codice) == ENTI_TAPPARELLA)) 
+			  {
+                device = (uint8_t)strtol(sistema_scs.elenco[i].address, NULL, 16);
+                if (comando == "SALITA") //  && sistema_scs.elenco[i].pin != -1) 
                 {
-                    elencoEntita[i].stato = "SALITA";
+                    strcpy (sistema_scs.elenco[i].stato, "SALITA");
                     command = 0x08;
                 } 
-                else if (comando == "DISCESA") // && elencoEntita[i].pin2 != -1) 
+                else if (comando == "DISCESA") // && sistema_scs.elenco[i].pin2 != -1) 
                 {
-                    elencoEntita[i].stato = "DISCESA";
+                    strcpy (sistema_scs.elenco[i].stato, "DISCESA");
                     command = 0x09;
                 } 
                 else 
                 {
-                    elencoEntita[i].stato = "STOP";
+                    strcpy (sistema_scs.elenco[i].stato, "STOP");
                     command = 0x0A;
                 }
                 requestLen = 0;
@@ -3468,11 +2503,7 @@ void createWebServer(int webtype)
                 requestBuffer[requestLen++] = command;// command
 
                 // Invia l'aggiornamento SSE alla pagina Home
-                eventity.send(elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-                
-                // Salva lo stato su LittleFS
-//                salvaStatiSuFile();
-                break;
+                eventity.send(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address, millis());
             }
         }
         request->send(200, "text/plain", "OK");
@@ -3491,68 +2522,68 @@ void createWebServer(int webtype)
         unsigned char command = 0;  
         unsigned char device = 0;
         
-        for (int i = 0; i < numeroEntita; i++) {
-            if (elencoEntita[i].id == idRichiesto && elencoEntita[i].tipo == ENTI_TAPPARELLA_PCT) {
-                device = elencoEntita[i].pin;
+        uint8_t i = CercaAddress(idRichiesto.c_str());
+        if (i != 0xFF)   
+        {
+            if  (tipo_to_hwType(sistema_scs.elenco[i].tipo_codice) == ENTI_TAPPARELLA_PCT) 
+			{
+                device = (uint8_t)strtol(sistema_scs.elenco[i].address, NULL, 16);
 // 0=stop   1=open    2=close   xxx=pct
-                if (comando == "SALITA") //  && elencoEntita[i].pin != -1) 
+                if (comando == "SALITA") //  && sistema_scs.elenco[i].pin != -1) 
                 {
-                    elencoEntita[i].stato = "SALITA";
+                    strcpy (sistema_scs.elenco[i].stato, "SALITA");
                     command = 0x08;
-//                    command = 1;
                 } 
-                else if (comando == "DISCESA") // && elencoEntita[i].pin2 != -1) 
+                else if (comando == "DISCESA") // && sistema_scs.elenco[i].pin2 != -1) 
                 {
-                    elencoEntita[i].stato = "DISCESA";
+                    strcpy (sistema_scs.elenco[i].stato, "DISCESA");
                     command = 0x09;
-//                    command = 2;
                 } 
-                else if (comando == "STOP") // && elencoEntita[i].pin2 != -1) 
+                else if (comando == "STOP") // && sistema_scs.elenco[i].pin2 != -1) 
                 {
-                    elencoEntita[i].stato = "STOP";
+                    strcpy (sistema_scs.elenco[i].stato, "STOP");
                     command = 0x0A;
-//                    command = 0;
                 } 
                 else 
                 {
                     int pct = comando.toInt();    // percentuale
                     if (pct == 0)
                     {
-                      elencoEntita[i].stato = "DISCESA";
+                    strcpy (sistema_scs.elenco[i].stato, "DISCESA");
                     }
                     else
                     if (pct == 100)
                     {
-                      elencoEntita[i].stato = "SALITA";
+                    strcpy (sistema_scs.elenco[i].stato, "DISCESA");
                     }
                     requestBuffer[requestLen++] = PIC_REQ;
                     requestBuffer[requestLen++] = 'u';
                     requestBuffer[requestLen++] = device;		// to   device
                     requestBuffer[requestLen++] = (unsigned char) pct;    // command (%)
-                    String payload = String(comando) + "|" + elencoEntita[i].stato;
-                    eventity.send(payload.c_str(), elencoEntita[i].id.c_str(), millis());
+                    String payload = String(comando) + "|" + String(sistema_scs.elenco[i].stato);
+                    eventity.send(payload.c_str(), sistema_scs.elenco[i].address, millis());
+
 #ifdef DEBUG_EVENTITY
-          String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + payload;
+          String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + sistema_scs.elenco[i].id + " : " + payload;
           events.send(rispostaLog.c_str(), "log", millis());
 #endif
-                    break;
                 }
-
-                requestLen = 0;
-                requestBuffer[requestLen++] = PIC_REQ;
-                requestBuffer[requestLen++] = 'y';    // 0x79 (@y: invia a pic da MQTT cmd standard da inviare sul bus)
-                requestBuffer[requestLen++] = device; // to   device
-                requestBuffer[requestLen++] = 0x00;   // from device
-                requestBuffer[requestLen++] = 0x12;   // type:command
-                requestBuffer[requestLen++] = command;// command
-                // Invia l'aggiornamento SSE alla pagina Home
-                eventity.send(elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
+                if (command != 0)
+                {
+                    requestLen = 0;
+                    requestBuffer[requestLen++] = PIC_REQ;
+                    requestBuffer[requestLen++] = 'y';    // 0x79 (@y: invia a pic da MQTT cmd standard da inviare sul bus)
+                    requestBuffer[requestLen++] = device; // to   device
+                    requestBuffer[requestLen++] = 0x00;   // from device
+                    requestBuffer[requestLen++] = 0x12;   // type:command
+                    requestBuffer[requestLen++] = command;// command
+                    // Invia l'aggiornamento SSE alla pagina Home
+                    eventity.send(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address, millis());
+                }
 #ifdef DEBUG_EVENTITY
-          String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + elencoEntita[i].stato;
+          String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + sistema_scs.elenco[i].address + " : " + sistema_scs.elenco[i].stato;
           events.send(rispostaLog.c_str(), "log", millis());
 #endif
-
-                break;
             }
         }
         request->send(200, "text/plain", "OK");
@@ -3574,45 +2605,242 @@ void createWebServer(int webtype)
     // GESTIONE DEL FORM DI INPUT (POST)
     a_server.on("/invia", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (request->hasParam("testo", true)) {
+            uint8_t result = 0; // 1=eseguito   2=a pic   3=rifiutato
             String comandoRicevuto = request->getParam("testo", true)->value();
+
+			rimuovi_spazi_string(comandoRicevuto);
+			if (comandoRicevuto[0] == '*')
+				comandoRicevuto[0] = '@';
             
             // Stampa sulla seriale dell'ESP32 il comando ricevuto
 //            Serial.printf("Comando utente ricevuto: %s\n", comandoRicevuto.c_str());
             
             // Genera immediatamente un log confermando la ricezione
-            String rispostaLog = "[" + String(millis()/100) + "s] [CMD] Eseguito: " + comandoRicevuto;
-            events.send(rispostaLog.c_str(), "log", millis());
+//            String rispostaLog = "[" + String(millis()/100) + "s] [CMD] Eseguito: " + comandoRicevuto;
+//            events.send(rispostaLog.c_str(), "log", millis());
 
-            requestLen = comandoRicevuto.length();
-            comandoRicevuto.toCharArray(requestBuffer, requestLen+1);
+			// Esempio di invio dello stato (Max 32 caratteri gestiti in sicurezza lato client)
+//			events.send("In funzione - OK", "stato", millis());
+
+		    prev_internal = 3;
+            if ((comandoRicevuto == "@MA") || (comandoRicevuto == "@o"))
+            {
+				internal = 0;
+            }
 
             if ((comandoRicevuto == "stop") || (comandoRicevuto == "STOP"))
             {
+				autocensimento = false;
                 events.send("stop", "chiudi_connessione");
                 setFirst();
+				internal = 1;
+                result = 1;
+//				request->send(200, "text/plain", "OK");
+            }
+            else
+            if (comandoRicevuto == "auto")
+			{
+	            events.send("Auto censimento attivo - 'off'  per terminare ", "log", millis());
+				autocensimento = true;
+                setFirst();
+				internal = 1;
+                result = 1;
+//				request->send(200, "text/plain", "OK");
+			}
+			else
+            if (comandoRicevuto == "off")
+			{
+	            events.send("Auto censimento terminato ", "log", millis());
+				autocensimento = false;
+                result = 1;
+//				request->send(200, "text/plain", "OK");
+			}
+			else
+            if (comandoRicevuto == "more")
+			{
+	            events.send("Media potenza wifi ", "log", millis());
+                result = 1;
+                gestisciPotenzaDinamica(2);
+			}
+			else
+            if (comandoRicevuto == "high")
+			{
+	            events.send("Top potenza wifi ", "log", millis());
+                result = 1;
+                gestisciPotenzaDinamica(3);
+			}
+			else
+            if (comandoRicevuto == "less")
+			{
+	            events.send("Bassa potenza wifi ", "log", millis());
+                result = 1;
+                gestisciPotenzaDinamica(1);
+			}
+			else
+            if (comandoRicevuto == "display")
+			{
+    // Creiamo un buffer grande per contenere molte righe di testo insieme
+    // 4096 byte bastano per circa 30-40 dispositivi a blocco
+                char *grandi_log = (char *)malloc(4096);
+                if (grandi_log != NULL) {
+                    grandi_log[0] = '\0'; // Inizializza la stringa vuota
+                    int contatore_righe = 0;
+
+                    for (int i=0; i<MY_ENTITA; i++)
+                    {
+                       if (sistema_scs.elenco[i].valido)
+                       {
+                          char buflog[128];
+                          String tipo_str = codifica_codice_a_tipo(sistema_scs.elenco[i].tipo_codice); 
+                          
+                          if (alexaParam == 'y') {
+                              snprintf(buflog, sizeof(buflog), "[%d] [scs] %d, id: %02X, %s, %s, st: %s, AX=%02X\n",
+                                (millis()/100), i, sistema_scs.elenco[i].id, tipo_str.c_str(), 
+                                sistema_scs.elenco[i].descrizione, sistema_scs.elenco[i].stato, sistema_scs.elenco[i].alexa_id);
+                          } else {
+                              snprintf(buflog, sizeof(buflog), "[%d] [scs] %d, id: %02X, %s, %s, st: %s\n",
+                                (millis()/100), i, sistema_scs.elenco[i].id, tipo_str.c_str(), 
+                                sistema_scs.elenco[i].descrizione, sistema_scs.elenco[i].stato);
+                          }
+
+                          // Concatena la riga nel mega buffer
+                          strcat(grandi_log, buflog);
+                          contatore_righe++;
+
+                          // Per sicurezza, se accumuliamo 15 righe, le spediamo per non riempire il buffer da 4100 byte
+                          if (contatore_righe >= 15) {
+                              events.send(grandi_log, "log", millis());
+                              grandi_log[0] = '\0'; // Svuota il buffer per le prossime righe
+                              contatore_righe = 0;
+                              vTaskDelay(pdMS_TO_TICKS(50)); // Qui il delay funziona perché la coda è libera
+                          }
+                       }
+                    }
+
+                    // Invia il residuo rimasto nel buffer se rimangono dispositivi
+                    if (strlen(grandi_log) > 0) {
+                        events.send(grandi_log, "log", millis());
+                    }
+
+                    free(grandi_log); // LIBERA SEMPRE LA MEMORIA!
+                }
+
+                result = 1;
+//                request->send(200, "text/plain", "OK");
+			}
+			else
+            if (comandoRicevuto == "mqttnew")
+			{
+              if (mqttopen == 3)
+              {
+                 char *grandi_log = (char *)malloc(4096);
+                 if (grandi_log != NULL) 
+                 {
+                    grandi_log[0] = '\0'; // Inizializza la stringa vuota
+                    int contatore_righe = 0;
+                    size_t offset = 0;
+                    for (int i=0; i<MY_ENTITA; i++)
+                    {
+                       if (sistema_scs.elenco[i].valido)
+                       {
+                          size_t added = MQTTnewdiscover(sistema_scs.elenco[i].tipo_codice, sistema_scs.elenco[i].address, sistema_scs.elenco[i].descrizione, grandi_log+offset, 4096-offset);
+                          contatore_righe++;
+                          offset += added;
+                          // Per sicurezza, se accumuliamo 15 righe, le spediamo per non riempire il buffer da 4100 byte
+                          if (contatore_righe >= 15) {
+                              events.send(grandi_log, "log", millis());
+                              grandi_log[0] = '\0'; // Svuota il buffer per le prossime righe
+                              contatore_righe = 0;
+                              offset = 0;
+                              vTaskDelay(pdMS_TO_TICKS(50)); // Qui il delay funziona perché la coda è libera
+                          }
+                       }
+                    }
+                    result = 1;
+                    // Invia il residuo rimasto nel buffer se rimangono dispositivi
+                    if (strlen(grandi_log) > 0) {
+                        events.send(grandi_log, "log", millis());
+                    }
+
+                    free(grandi_log); // LIBERA SEMPRE LA MEMORIA!
+
+                }  // log != NULL
+
+
+              } // mqttopen
+              else
+              {
+    	         events.send("MQTT non è attivo ", "log", millis());
+                 result = 3;
+              } // mqttopen
+			} // mqttnew
+			else
+            if ((comandoRicevuto == "internal") || (comandoRicevuto == "server"))
+            {
+                events.send("ripristino","log", millis());
+                setFirst();
+				internal = 1;
+                delay(5);
+                result = 1;
+//				request->send(200, "text/plain", "OK");
             }
             else
             if ((comandoRicevuto == "reload") || (comandoRicevuto == "RELOAD"))
             {
-#ifdef MY_DOMOTIC
-              events.send("Entità ricaricate - fai refresh pagina /sseha ", "log", millis());
-              reloadEntity(0);
-              delay(5);
-#endif
 #ifdef MY_TABELLA
-              events.send("Entità ricaricate - fai refresh pagina /devices ", "log", millis());
-              reloadDevices();
+			  inizializza_e_leggi_dispositivi_preferences();
+              events.send("Entità ricaricate - fai refresh pagina /dispositivi ", "log", millis());
               delay(5);
 #endif
+              result = 1;
+// 			  request->send(200, "text/plain", "OK");
+            }
+            else
+    		if ((comandoRicevuto[0] == '@') || (comandoRicevuto[0] == PIC_REQ))
+            {
+	            requestLen = comandoRicevuto.length();
+		        comandoRicevuto.toCharArray(requestBuffer, requestLen+1);
+			    immediateSend();
+                result = 2;
+//				request->send(200, "text/plain", "OK");
             }
             else
             {
-              immediateSend();
-              request->send(200, "text/plain", "OK");
+              result = 4;
+//                request->send(200, "text/plain", "Comando sconosciuto");
             }
-          } else {
+            if (result == 1)
+            {
+                String rispostaLog = "[" + String(millis()/100) + "s] [CMD] Eseguito: " + comandoRicevuto;
+                events.send(rispostaLog.c_str(), "log", millis());
+            }
+            else
+            if (result == 2)
+            {
+                String rispostaLog = "[" + String(millis()/100) + "s] [CMD] pic: " + comandoRicevuto;
+                events.send(rispostaLog.c_str(), "log", millis());
+            }
+            else
+            if (result == 3)
+            {
+                String rispostaLog = "[" + String(millis()/100) + "s] [CMD] Rifiutato: " + comandoRicevuto;
+                events.send(rispostaLog.c_str(), "log", millis());
+            }
+            else
+            if (result == 4)
+            {
+                String rispostaLog = "[" + String(millis()/100) + "s] [CMD] Sconosciuto: " + comandoRicevuto;
+                events.send(rispostaLog.c_str(), "log", millis());
+            }
+			request->send(200, "text/plain", "OK");
+
+//            else
+//				request->send(200, "text/plain", "KO");
+
+		} else {
             request->send(400, "text/plain", "Parametro mancante");
         }
+
     });
 
 
@@ -3620,7 +2848,11 @@ void createWebServer(int webtype)
 // =============================================================================================
     // Rotta Principale: serve la pagina HTML di controllo
     a_server.on("/sselog", HTTP_GET, [](AsyncWebServerRequest *request){
+        setFirst();
+		internal = 1;
         request->send(200, "text/html", index_html_LOG);
+		prev_internal = 5;
+        delay_internal = 300;
     });
 
     // Registrazione del gestore SSE sul server
@@ -3649,11 +2881,11 @@ void createWebServer(int webtype)
 //    content += "<li>/backsetting  (setup http callback)</li>";  - NASCOSTO
       content += "<li>/mqttconfig (setup mqtt broker)</li>";
 //      content += "<li>/mqttcfg   (setup mqtt broker)</li>";     - NASCOSTO
-      content += "<li>/mqttdevices (mqtt devices discover)</li>";
-      content += "<li>/devicename (mqtt devices names)</li>";
-      content += "<li>/sselog     (SCS LOG)</li>";
-      content += "<li>/devices    (CENSIMENTO)</li>";
-      content += "<li>/sseha      (DOMOTIC)</li>";
+//      content += "<li>/mqttdevices (mqtt devices discover)</li>";
+//      content += "<li>/devicename (mqtt devices names)</li>";
+      content += "<li>/sselog      (SCS LOG)</li>";
+      content += "<li>/dispositivi (CENSIMENTO)</li>";
+      content += "<li>/sseha       (DOMOTIC)</li>";
       content += "</ol>";
       content += "</form></html>";
       request->send(200, "text/html", content);
@@ -3668,37 +2900,6 @@ void createWebServer(int webtype)
    {
 // =============================================================================================
       scanProcess();
-/*
-      String sTemp;
-
-      if ( connectionType == 1 ) // server web AP
-        sTemp = WiFi.softAPIP().toString();
-      else
-        sTemp = WiFi.localIP().toString();
-        
-      content = "<!DOCTYPE HTML>\r\n<html>Hello from ESP32_" _MODO "GATE " _FW_VERSION " at ";
-      content += sTemp;
-      content += "<p>";
-      content += wifiSignals;
-
-      content += "</p><form method='get' action='setting'><label>SSID: </label>";
-      content += "<input name='ssid' maxlength=32 value='";
-      sTemp = ReadStream(&sTemp[0], E_SSID, 32, 2);  // tipo=0 binary array   1:ascii array   2:ascii string
-      content += sTemp;
-      content += "' style='width:150px'><label> PSW: </label><input name='pass' maxlength=64 value='";
-      sTemp = ReadStream(&sTemp[0], E_PASSW, 32, 2);  // tipo=0 binary array   1:ascii array   2:ascii string
-      content += sTemp;
-      content += "' style='width:150px'><label> IP address:</label><input name='ip' maxlength=16 value='";
-      sTemp = ReadStream(&sTemp[0], E_IPADDR, 16, 2);  // tipo=0 binary   1:ascii   2=string
-      content += sTemp;
-      content += "' style='width:100px'><label> Gateway IP</label><input name='rip' maxlength=16 value='";
-      sTemp = ReadStream(&sTemp[0], E_ROUTIP, 16, 2);  // tipo=0 binary   1:ascii  2=string
-      content += sTemp;
-      content += "' style='width:100px'><label>UDP port</label><input name='uport' maxlength=5 value='";
-      sTemp = ReadStream(&sTemp[0], E_PORT, 6, 2);  // tipo=0 binary   1:ascii   2=string
-      content += sTemp;
-      content += "' style='width:50px'><input type='submit'></form></html>";
-*/
       request->send(200, "text/html", content);
       content = "";
     });
@@ -3722,9 +2923,8 @@ void createWebServer(int webtype)
     a_server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request)
    {
 // =============================================================================================
-      WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-      EEPROM.commit();
       setFirst();
+      internal = 1;
 
       String param = request->arg("device");
 
@@ -3755,7 +2955,8 @@ void createWebServer(int webtype)
       else if (param == "pic")
       {
         uartSemaphor = 1;
-        requestBuffer[requestLen++] = '@';
+        requestBuffer[requestLen++] = PIC_REQ;
+//        requestBuffer[requestLen++] = '@';
         requestBuffer[requestLen++] = '|';
         requestBuffer[requestLen++] = '|';
         content = "{\"status\":\"OK\"}";
@@ -3764,7 +2965,8 @@ void createWebServer(int webtype)
       else if (param == "all")
       {
         uartSemaphor = 1;
-        requestBuffer[requestLen++] = '@';
+        requestBuffer[requestLen++] = PIC_REQ;
+//        requestBuffer[requestLen++] = '@';
         requestBuffer[requestLen++] = '|';
         requestBuffer[requestLen++] = '|';
         uartSemaphor = 0;
@@ -3774,8 +2976,10 @@ void createWebServer(int webtype)
       else if (events.count() != 0)
       {
         content = "{\"status\":\"SSE closed\"}";
-
-        events.send("stop", "chiudi_connessione");
+        if (events.count() != 0) 
+        {
+            events.send("stop", "chiudi_connessione");
+        }
         delay(50); // Piccolo delay per dare tempo alla rete di trasmettere
         events.close();
 
@@ -3830,9 +3034,6 @@ void createWebServer(int webtype)
 // =============================================================================================
 
 
-
-
-
 // =============================================================================================
     a_server.on("/status", HTTP_GET, [] (AsyncWebServerRequest *request) 
     {
@@ -3843,11 +3044,17 @@ void createWebServer(int webtype)
         content += " at ";
         
         content += WiFi.localIP().toString();
-        content += "<p><ol>";
+
+
+        content += "<pre style='background: #ffffff; padding: 10px; border: 1px solid #ccc; border-radius: 4px; color: #000000; font-family: monospace;'>";
+
+
+//        content += "<p><ol>";
 
         if (connectionType == 1) // web server AP
         {
-          Serial1.write('@');   // set led lamps
+//          Serial1.write('@');   // set led lamps
+          Serial1.write(PIC_REQ);   // set led lamps
           Serial1.write(0xF2);  // set led lamps high-freq (AP mode)
           content += "<li>";
           content += "Working as AP ";
@@ -3855,7 +3062,8 @@ void createWebServer(int webtype)
         }
         else
         {
-          Serial1.write('@');   // set led lamps
+//          Serial1.write('@');   // set led lamps
+          Serial1.write(PIC_REQ);   // set led lamps
           Serial1.write(0xF1);  // set led lamps std-freq (client mode)
           content += "<li>";
           content += "System frequency (Mhz): ";
@@ -3864,15 +3072,17 @@ void createWebServer(int webtype)
           content += "</li>";
 
           content += "<li>";
-          content += "Wifi connection ssid: ";
+          content += "Wifi ssid: ";
           char hBuffer[64];
           sprintf(hBuffer, "%s - Ch:%d - (%ddBm)", WiFi.SSID().c_str(), WiFi.channel(), WiFi.RSSI());
           content += hBuffer;
-          content += "</li>";
-
-          content += "<li>";
-          content += "Router IP: ";
+          content += " - Router: ";
           content += WiFi.gatewayIP().toString();
+          sprintf(hBuffer, " - Potenza Wi-Fi: %.2f dBm", TxPower * 0.25);
+          content += hBuffer;
+          sprintf(hBuffer, " - Sicurezza: ");
+          content += hBuffer;
+          content += getWiFiAuthMode();
           content += "</li>";
         }
 
@@ -3917,12 +3127,17 @@ void createWebServer(int webtype)
         content += "<li>";
         content += "SSE CLIENTS: ";
         content += String(events.count());
+
+        char hBuf[4];
+        content += " - Domotic options: ";
+        sprintf(hBuf, "%02X", domotic_options);
+        content += hBuf;
         content += "</li>";
 
-        if (ArduinoOTAflag > 0)
-        {
-          content += "<li>OTA update ready</li>";  
-        }
+//        if (ArduinoOTAflag > 0)
+//        {
+//          content += "<li>OTA update ready</li>";  
+//        }
         content += "<li>";
         content += "Http callback setup = ";
         if (httpCallback[0] == ':')
@@ -3941,109 +3156,238 @@ void createWebServer(int webtype)
         else if (mqttopen == 3)
           content += "MQTT connection is OPEN ";
 
-        content += "</li>";
 
         if (alexaParam  == 'y')
         {
+          content += "</li>";
           content += "<li>fauxmo ECHO DOT direct connection</li>";
-          sprintf(temp, "<li>  %d devices added</li>", id_fauxmo + 1);
+          sprintf(temp, "<li>  %d devices added - ", id_fauxmo + 1);
           content += temp;
-          sprintf(temp, "<li>  %d devices discovered</li>", fauxmo.discovered());
+          sprintf(temp, "  %d devices discovered</li>", fauxmo.discovered());
           content += temp;
         }
         else
         {
-          content += "<li>MQTT broker is: ";
+          content += " - broker is: ";
           content += mqtt_server;
           content += "   port: ";
           content += mqtt_port;
+
+          content += "  - ";
+          content += " conn.retry: ";
+          content += String(mqtt_connections,DEC);
+          content += "</li>";
         }
-        content += "</li>";
+//        content += "</li>";
 
         if (mqttopen > 0)
         {
-          content += "<li>";
+          content += " - ";
           if (domoticMode == 'd')
-            content += "mqtt model: DOMOTICZ";
+            content += " mode: DOMOTICZ";
           else if (domoticMode == 'h')
-            content += "mqtt model: HOMEASSISTANT";
+            content += " mode: HOMEASSISTANT";
           else if (domoticMode == 'D')
-            content += "mqtt model: DOMOTICZ 1-2";
+            content += " mode: DOMOTICZ 1-2";
           else if (domoticMode == 'H')
-            content += "mqtt model: HOMEASSISTANT 1-2";
+            content += " mode: HOMEASSISTANT 1-2";
           else
             content += "mqtt model: GENERIC";
           content += "</li>";
         }
-        char hBuf[4];
-        content += "<li>Domotic options: ";
-        sprintf(hBuf, "%02X", domotic_options);
-        content += hBuf;
-        content += "</li>";
 
         if ((mqttopen > 0) || (alexaParam == 'y'))
         {
           content += "<li>known devices in eeprom: ";
-          char devtype;
-          char devNr = 0;
-          char nomeDevice[6];
-          char device;
-          char devx = 1;
-          while ((devx < DEV_NR) && (device_BUS_id[devx].addressW))
+          for (uint8_t i = 0; i < MY_ENTITA; i++)
           {
-            devtype = device_BUS_id[devx].deviceType;
-            if ((devtype > 0) && (devtype < 32))
-            {
-              devNr++;
-              DeviceOfIx(devx, nomeDevice);
-              content += nomeDevice;
-              content += " ";
+              if (sistema_scs.elenco[i].valido == 1)
+              {
+                  content += String(sistema_scs.elenco[i].address);
+                  content += " ";
             }
-            devx++;
           }
           content += "</li>";
         }
 
-        content += "<li>";
-        content += "ESP mode: " _MODO;
-        content += "</li>";
+//        content += "<li>";
+//        content += "ESP mode: " _MODO;
+//        content += "</li>";
 
-        sprintf(temp, "<li>Free heap: %d bytes</li>", ESP.getFreeHeap());
-        content += temp;
+//        sprintf(temp, "<li>Free heap: %d bytes</li>", ESP.getFreeHeap());
+//        content += temp;
 
         content += "<li>";
         content += "PIC fw version: ";
         content += picfwVersion;
         content += "</li>";
 
-        content += "<li>";
-        content += "MQTT connection retries: ";
-        content += String(mqtt_connections,DEC);
-        content += "</li>";
+//        content += "<li>";
+//        content += "INFO numero: ";
+//        content += String(numeroInfo,DEC);
+//        content += "</li>";
 
       // @Qr
-        Serial1.write(PIC_REQ);    // command mode 
-        Serial1.write('Q');    // command: query 
-        Serial1.write('r');    // query PIC reset nrs
-        delay(2);            // wait 2ms
-        char nrs = 0;
-        nrs = Serial1.read();        // receive from serial USB
-        content += "<li>";
-        content += "ESP resets: ";
-        content += String(nrs,DEC);
-        content += "</li>";
+//        Serial1.write(PIC_REQ);    // command mode 
+//        Serial1.write('Q');    // command: query 
+//        Serial1.write('r');    // query PIC reset nrs
+//        delay(2);            // wait 2ms
+//        char nrs = 0;
+//        nrs = Serial1.read();        // receive from serial USB
+//        content += "<li>";
+//        content += "ESP resets: ";
+//        content += String(nrs,DEC);
+//        content += "</li>";
 
-        content += "<li>";
-        content += "</li>";
+//        content += "<li>";
+//        content += "END of report ";
+//        content += "</li>";
 
-        content += "<li>";
-        content += "END of report ";
-        content += "</li>";
+//        content += "</ol>";
 
-        content += "</ol>";
-        content += "</form></html>";
-        request->send(200, "text/html", content);
-        content = "";
+
+
+    content += "</pre>"; // Chiudiamo il blocco preformattato
+
+
+
+    // --- 🟢 CHUNK 3: DIAGNOSTICA MEMORIA INTERNA ---
+    uint32_t flash_size_bytes = 0;
+    esp_flash_get_size(NULL, &flash_size_bytes);
+    
+    size_t total_sram = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t watermark_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t max_block_sram = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    char *p_buf = (char *)malloc(1024);
+
+    // Nota i modificatori %zu per le variabili size_t e la correzione per la Flash
+    int len = snprintf(p_buf, 1024,
+        "- Flash Fisica Rilevata: %lu MB (%lu Byte)\r\n"
+        "- RAM Interna Totale Heap...: %zu Byte\r\n"
+        "- RAM Interna (SRAM) Libera : %zu Byte\r\n"
+        "- RAM Interna Minima Storica: %zu Byte (Watermark)\r\n"
+        "- RAM Interna Blocco Max    : %zu Byte (Allocabile contiguo)\r\n",
+        (unsigned long)(flash_size_bytes / (1024 * 1024)), 
+        (unsigned long)flash_size_bytes, 
+        total_sram, 
+        free_sram, 
+        watermark_sram, 
+        max_block_sram);
+
+    content += "<h3>Mappa della memoria:</h3>";
+//    content += "<pre style='background:#222; padding:10px; border-radius:4px; color:#fff;'>";
+    content += "<pre style='background: #ffffff; padding: 10px; border: 1px solid #ccc; border-radius: 4px; color: #000000; font-family: monospace;'>";
+	content += p_buf;
+    content += "</pre>"; // Chiudiamo il blocco preformattato
+
+
+
+    // --- 🟢 CHUNK 4: SCANSIONE DINAMICA DELLE PARTIZIONI ATTIVE ---
+    // Apriamo un tag <pre> per mantenere gli spaziamenti e i caratteri a larghezza fissa (stile console)
+    content += "<h3>Mappa delle Partizioni Flash:</h3>";
+//    content += "<pre style='background:#222; padding:10px; border-radius:4px; color:#fff;'>";
+    content += "<pre style='background: #ffffff; padding: 10px; border: 1px solid #ccc; border-radius: 4px; color: #000000; font-family: monospace;'>";
+
+    // Otteniamo l'iteratore iniziale per tutte le partizioni
+    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
+    
+    // Verifichiamo che l'iteratore sia valido e che il tuo buffer allocato con malloc esista
+    if (it != NULL && p_buf != NULL) {
+        
+        while (it != NULL) {
+            const esp_partition_t *part = esp_partition_get(it);
+            
+            if (part != NULL) {
+                const char* tipo_str = (part->type == ESP_PARTITION_TYPE_APP) ? "APP " : "DATA";
+                
+                // Utilizziamo in sicurezza il tuo char *p_buf allocato tramite malloc(1024)
+                snprintf(p_buf, 1024,
+                    "  - Label: %-10s | Tipo: %s | Offset: 0x%08X | Dim: %7u Byte (%u KB)\n",
+                    part->label, 
+                    tipo_str, 
+                    (unsigned int)part->address, 
+                    (unsigned int)part->size, 
+                    (unsigned int)(part->size / 1024));
+                    
+                // Accumuliamo i dati nella stringa HTML complessiva
+                content += p_buf;
+            }
+            
+            // Avanziamo l'iteratore alla partizione successiva
+            it = esp_partition_next(it);
+        }
+        
+        // NOTA: esp_partition_next rilascia automaticamente l'iteratore quando raggiunge la fine (diventando NULL).
+        // Non serve chiamare esp_partition_iterator_release(it) se 'it' è già diventato NULL, 
+        // poiché non farebbe nulla o potrebbe invalidare puntatori di sistema.
+        
+    } else {
+        content += "  [Errore: Impossibile leggere la tabella delle partizioni o memoria insufficiente]\n";
+    }
+    content += "</pre>"; // Chiudiamo il blocco preformattato
+
+
+
+
+
+    // --- 🟢 CHUNK 5: CALCOLO METRICHE FIRMWARE E CHIUSURA PAGINA ---
+    const esp_partition_t *running_part = esp_ota_get_running_partition();
+    
+    uint32_t app_bin_size = 0;
+    uint32_t free_partition_space = 0;
+    float app_percentage_occupied = 0.0f;
+
+    if (running_part != NULL) {
+        esp_image_metadata_t img_data;
+        const esp_partition_pos_t part_pos = {
+            .offset = running_part->address,
+            .size = running_part->size,
+        };
+        
+        // Analizza i segmenti hardware e ottiene l'esatta lunghezza del firmware binario
+        if (esp_image_verify(ESP_IMAGE_VERIFY_SILENT, &part_pos, &img_data) == ESP_OK) {
+            app_bin_size = img_data.image_len;
+            free_partition_space = running_part->size - app_bin_size;
+            app_percentage_occupied = ((float)app_bin_size / (float)running_part->size) * 100.0f;
+        }
+    }
+
+    // Buffer locale temporaneo per formattare la sezione delle metriche
+//    char metriche_buf[512];
+    snprintf(p_buf, 1024,
+        "<h3>Metriche Memoria Applicazione:</h3>"
+        "<pre style='background:#222; padding:10px; border-radius:4px; color:#ffb300; font-family:monospace;'>"
+        "- Dimensione Reale Firmware : %u Byte (%u KB) [%.2f%% della partizione]\n"
+        "- Spazio Libero in Partizione: %u Byte (%u KB)\n"
+        "</pre>",
+        (unsigned int)app_bin_size,
+        (unsigned int)(app_bin_size / 1024),
+        app_percentage_occupied,
+        (unsigned int)free_partition_space,
+        (unsigned int)(free_partition_space / 1024)
+    );
+
+
+    // Accodiamo le metriche calcolate alla stringa principale della pagina
+    content += p_buf;
+    content += "</pre>"; // Chiudiamo il blocco preformattato
+
+
+
+
+
+
+
+
+    free(p_buf);
+    content += "</form></html>";
+    request->send(200, "text/html", content);
+    content = "";
+
+
+
+
 // =============================================================================================
     });
 
@@ -4060,7 +3404,6 @@ a_server.on("/help", HTTP_GET, [] (AsyncWebServerRequest *request)
       int bytesread = 1;
       String to_send = "";
 
-//      to_send = "<!DOCTYPE HTML>\r\n<html>Hello from ESP32_" _MODO "GATE " _FW_VERSION;
       to_send = "<HTML><BODY>\r\nHello from ESP32_" _MODO "GATE " _FW_VERSION;
       to_send += " at ";
       to_send += WiFi.localIP().toString();
@@ -4068,7 +3411,8 @@ a_server.on("/help", HTTP_GET, [] (AsyncWebServerRequest *request)
 
       if (connectionType == 1) // web server AP
       {
-        Serial1.write('@');   // set led lamps
+//        Serial1.write('@');   // set led lamps
+        Serial1.write(PIC_REQ);   // set led lamps
         Serial1.write(0xF2);  // set led lamps high-freq (AP mode)
         to_send += "<li>";
         to_send += "Working as AP ";
@@ -4076,7 +3420,8 @@ a_server.on("/help", HTTP_GET, [] (AsyncWebServerRequest *request)
       }
       else
       {
-        Serial1.write('@');   // set led lamps
+//      Serial1.write('@');   // set led lamps
+        Serial1.write(PIC_REQ);   // set led lamps
         Serial1.write(0xF1);  // set led lamps std-freq (client mode)
         to_send += "<li>";
         to_send += "System frequency (Mhz): ";
@@ -4436,7 +3781,6 @@ a_server.on("/help", HTTP_GET, [] (AsyncWebServerRequest *request)
           WriteEEP(alex[0], E_ALEXA);
           content = "{\"Success\":\"saved to eeprom ";
 
-          WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
           EEPROM.commit();
           content += " ... please use .../reset?device=esp    to boot into new mqtt broker\"}";
           statusCode = 200;
@@ -4445,473 +3789,6 @@ a_server.on("/help", HTTP_GET, [] (AsyncWebServerRequest *request)
         content = "";
 // =============================================================================================
     });
-
-
-
-
-
-// =============================================================================================
-    a_server.on("/mqttdevices", HTTP_GET, [] (AsyncWebServerRequest *request) 
-    {
-// =============================================================================================
-        String richiesta;
-        richiesta = request->arg("request");
-
-        uartSemaphor = 1;
-        if (firstTime == 0) setFirst();  // DEVONO essere attivi @MX  e @l
-
-        if (richiesta == "clear")
-        {
-          content = "{\"status\":\"OK - tab cleared...\"}";
-          statusCode = 200;
-          for (int i = 0; i < DEV_NR; ++i)
-          {
-            EEPROM.write((int) i * E_ALEXA_DESC_LEN + E_ALEXA_DESC_DEVICE, 0);
-          device_BUS_id[i].Val = 0;
-          }
-          WriteEEP((char) 0, (int) E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-          EEPROM.commit();
-          requestBuffer[requestLen++] = PIC_REQ;
-          requestBuffer[requestLen++] = 'U';
-          requestBuffer[requestLen++] = '9';
-        }
-        else
-
-          if (richiesta == "prepare")
-          {
-            content = "{\"status\":\"OK - proceed\" ";
-            if (mqttopen == 3)
-              content += ", \"mqtt\":\"ready\"}";
-            else
-              content += ", \"mqtt\":\"CLOSED\"}";
-
-            statusCode = 200;
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = DEVICEREQUEST;
-            requestBuffer[requestLen++] = 0xFF;
-            immediateSend();
-            delay(200);       // wait 200mS
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = 'U';
-            requestBuffer[requestLen++] = '1';
-          }
-
-
-          else if (richiesta == "start")
-          {
-            content = "{\"status\":\"OK - started\" ";
-            if (mqttopen == 3)
-              content += ", \"mqtt\":\"ready\"}";
-            else
-              content += ", \"mqtt\":\"CLOSED\"}";
-            statusCode = 200;
-
-            devIx = 1;
-            devCtr = 0;
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = 'U';
-            requestBuffer[requestLen++] = '2'; // fine censimento
-            immediateSend();
-            delay(600);       // wait 600mS due to pic eeprom write
-
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = DEVICEREQUEST;
-            requestBuffer[requestLen++] = devIx;
-          }
-
-
-        /*
-          else
-          if (richiesta == "term")
-          {
-            content = "{\"status\":\"OK - terminated...\"}";
-            statusCode = 200;
-            devIx = 0;
-            WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-            EEPROM.commit();
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = 'U';
-            requestBuffer[requestLen++] = '3';
-            immediateSend();
-            delay(200); // wait 100mS due to eeprom write
-          }
-        */
-
-
-          else if (richiesta == "stop")
-          {
-            content = "{\"status\":\"OK - stopped...\"}";
-            statusCode = 200;
-            devIx = 0;
-            WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-            EEPROM.commit();
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = 'U';
-            requestBuffer[requestLen++] = '3';
-            immediateSend();
-            delay(200); // wait 100mS due to eeprom write
-          }
-          else if (richiesta == "resend")
-          {
-            if (mqttopen == 3)
-            {
-              content = "<!DOCTYPE HTML>\r\n<html>Hello from ESP32_" _MODO "GATE " _FW_VERSION;
-              content += "<p><ol>";
-              statusCode = 200;
-
-              char devtype;
-              char nomeDevice[6];
-              char devx = 1;
-              while ((devx < DEV_NR) && (device_BUS_id[devx].addressW))
-              {
-                devtype = device_BUS_id[devx].deviceType;
-                if ((devtype > 0) && (devtype < 32))
-                {
-                  MQTTnewdevice(devx, nomeDevice);
-                  content += "<li>";
-                  content += nomeDevice;
-                  if (devtype == 1)
-                    content += "switch";
-                  else if (devtype == 3)
-                    content += "dimmer";
-                  else if (devtype == 8)
-                    content += "cover";
-                  else if (devtype == 9)
-                    content += "coverpct";
-                  else if (devtype == 11)
-                    content += "generic";
-                  else if (devtype == 14) // 0x0E)
-                    content += "alarm board";
-                  else if (devtype == 15) // 0x0F)
-                    content += "termo";
-                  else if (devtype == 18)
-                    content += "cover1";
-                  else if (devtype == 19)
-                    content += "coverpct1";
-
-                  content += "</li>";
-                }
-                devx++;
-              }
-              content += "</ol>";
-              content += "</form></html>";
-            }
-            else
-            {
-              content = "{\"status\":\"KO - MQTT service not available...\"}";
-              statusCode = 400;
-            }
-          }
-
-
-          else
-          { // query
-            if (devIx == 0)
-            {
-              content = "<!DOCTYPE HTML>\r\n<html>OK - list of discovered devices:";
-              content += "<p><ol>";
-              statusCode = 200;
-
-              char devtype;
-              char nomeDevice[6];
-          char devx = 1;
-              while ((devx < DEV_NR) && (device_BUS_id[devx].addressW))
-              {
-                devtype = device_BUS_id[devx].deviceType;
-                if ((devtype > 0) && (devtype < 32))
-                {
-                  DeviceOfIx(devx, (char *)nomeDevice);
-                  content += "<li>";
-                  content += nomeDevice;
-                  if (devtype == 1)
-                    content += "switch";
-                  else if (devtype == 3)
-                    content += "dimmer";
-                  else if (devtype == 8)
-                    content += "cover";
-                  else if (devtype == 18)
-                    content += "cover U";
-                  else if (devtype == 11)
-                    content += "generic";
-                  else if (devtype == 14) // 0x0E)
-                    content += "alarm board";
-                  else if (devtype == 15) // 0x0F)
-                    content += "termo";
-                  else if (devtype == 9)
-                    content += "coverpct";
-                  else if (devtype == 19)
-                    content += "coverpct U";
-                  
-                  if ((devtype == 9) || (devtype == 19))
-                  {
-                    requestBuffer[requestLen++] = PIC_REQ;
-                    requestBuffer[requestLen++] = 'U';
-                    requestBuffer[requestLen++] = '6';
-                    requestBuffer[requestLen++] = device_BUS_id[devx].address;
-                    immediateSend();
-                    char m = immediateReceive('[');
-                    if (m > 8)
-                    {
-                      char hBuffer[32];
-                      sprintf(hBuffer, " %02X%02X %02X%02X %02X %02X%02X %02X", replyBuffer[1], replyBuffer[2], replyBuffer[3], replyBuffer[4], replyBuffer[5], replyBuffer[6], replyBuffer[7], replyBuffer[8]);
-                      content += hBuffer;
-                    }
-                    else
-                    {
-                      //              content += " ?parms? ";
-                      char hBuffer[24];
-                      sprintf(hBuffer, " (%d) ", m);
-                      content += hBuffer;
-                      char n = 1;
-                      while (n < m)
-                      {
-                        sprintf(hBuffer, "%02X ", replyBuffer[n]);
-                        content += hBuffer;
-                        n++;
-                      }
-                    }
-                  } // devtype = 9
-
-                  content += "  ";
-                  content += descrOfIx(devx);
-                  content += "</li>";
-                } // devtype > 0
-                devx++;
-              }  // while
-              content += "</ol>";
-              content += "</form></html>";
-            } // devIx == 0
-            else
-            {
-              content = "{\"status\":\"waiting query 0x";
-              char hBuffer[4];
-              sprintf(hBuffer, "%02X", devIx);
-              content += hBuffer;
-              content += " \"}";
-              statusCode = 200;
-            }
-          }
-        uartSemaphor = 0;
-
-        request->send(statusCode, "text/html", content);
-        content = "";
-// =============================================================================================
-    });
-
-
-
- 
-
-
-
-// =============================================================================================
-    a_server.on("/devicename", HTTP_GET, [] (AsyncWebServerRequest *request) 
-    {
-// =============================================================================================
-  
-        // denominazione manuale
-        char device  = 0;
-        char devtype = 0;
-        char deviceX = 0;
-        char nomeDevice[6];
-        char temp[32];
-        char *ch;
-        WORD_VAL maxp;
-        
-        String AlexaDescr = "";
-        String TypeDescr = "";
-        String EndMsg = "";
-
-        nomeDevice[0] = 0;
-        temp[0] = 0;
-
-        if (firstTime == 0) setFirst();  // DEVONO essere attivi @MX  e @l
-
-
-
-        // -------------- manual update start -------------------
-
-        if (request->hasArg("busid"))
-        {
-          String busid = request->arg("busid");
-          if ((busid != "") 
-          &&  (busid.length() > 1))
-          {
-            deviceX = ixOfDeviceNew(&busid[0]);
-            if (deviceX > 0) 
-            {
-              if (request->hasArg("devname"))
-              {
-                String edesc = descrOfIx(deviceX);
-                AlexaDescr = request->arg("devname");
-                if (AlexaDescr != edesc)
-                {
-                  if (alexaParam == 'y' )
-                  {
-                    fauxmo.renameDevice(&edesc[0], &AlexaDescr[0]);
-                  }
-                  WriteDescrOfIx(AlexaDescr, deviceX);
-                  EndMsg = "<li>UPDATED !!!</li>";
-                }
-              }
-              if (request->hasArg("maxpos"))
-              {
-                String maxpos = request->arg("maxpos");
-                maxp.Val = (int)strtoul(&maxpos[0], &ch, 10);
-              }
-              else
-                maxp.Val = 0;
-                
-              if (request->hasArg("type"))
-              {
-                String stype = request->arg("type");
-                char type = (char) stype.toInt();
-                if (type == 0) type = 1;
-                devtype = device_BUS_id[deviceX].deviceType;
-                if (type != devtype)
-                {
-                  device_BUS_id[deviceX].deviceType = type;
-                  devtype = type;
-                  EndMsg = "<li>UPDATED !!!</li>";
-                }
-              }
-
-              if (EndMsg != "")
-              {
-                  WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-                  EEPROM.commit();
-              }
-              AlexaDescr = "";
-              if ((devtype == 9) || (devtype == 19))
-              {
-                requestBuffer[requestLen++] = PIC_REQ;
-                requestBuffer[requestLen++] = 'U';
-                requestBuffer[requestLen++] = '8';
-                requestBuffer[requestLen++] = device_BUS_id[deviceX].address;     // device id
-                requestBuffer[requestLen++] = devtype;    // device type
-                requestBuffer[requestLen++] = maxp.byte.HB;    // max position H
-                requestBuffer[requestLen++] = maxp.byte.LB;    // max position L
-                immediateSend();
-                devtype = 0;
-                immediateReceive('k');
-              } // devtype == 9 || 19
-            } // ((deviceX > 0) && (devAddress < DEV_NR))
-          } // (request->hasArg("busid"))
-        } // (busid != "")
-        
-        
-        // -------------- end of update -------------------
-        
-        
-        deviceX++;
-      //  if (device_BUS_id[deviceX].address == 0)
-      //      deviceX = 1;
-        devtype = device_BUS_id[deviceX].deviceType;
-        
-        if ((deviceX >= DEV_NR)  || (device_BUS_id[deviceX].addressW == 0)) devtype=0;
-
-        if (device_BUS_id[deviceX].addressW > 0)
-        {
-          device = DeviceOfIx(deviceX, nomeDevice);
-          AlexaDescr = descrOfIx(deviceX);
-          if (devtype == 1)
-            TypeDescr = "1 switch";
-          else if (devtype == 2)
-            TypeDescr = "2 ";
-          else if (devtype == 3)
-            TypeDescr = "3 dimmer";
-          else if (devtype == 4)
-            TypeDescr = "4 dimmer";
-          else if (devtype == 8)
-            TypeDescr = "8 cover";
-          else if (devtype == 18)
-            TypeDescr = "18 cover1";
-          else if (devtype == 11)
-            TypeDescr = "11 generic";
-          else if (devtype == 14) // 0x0E)
-            TypeDescr = "E alarm board";
-          else if (devtype == 15) // 0x0F)
-            TypeDescr = "F termo";
-          else if (devtype == 9)
-            TypeDescr = "9 coverpct";
-          else if (devtype == 19)
-            TypeDescr = "19 coverpct1";
-          
-          if ((devtype == 9) || (devtype == 19))
-          {
-            requestBuffer[requestLen++] = PIC_REQ;
-            requestBuffer[requestLen++] = 'U';
-            requestBuffer[requestLen++] = '6';
-            requestBuffer[requestLen++] = device_BUS_id[deviceX].address;
-            immediateSend();
-            char m = immediateReceive('[');
-            //    replyBuffer[1], replyBuffer[2]  -  maxposition H-L
-            if (m > 8)
-            {
-              int c = replyBuffer[2] | replyBuffer[1] << 8;
-              sprintf(temp, "%d", c);
-            }
-            else
-              sprintf(temp, "nul");
-          }
-          else
-            TypeDescr = String((char)devtype,10);
-        }
-
-        content = "<!DOCTYPE HTML>\r\n<html>Discovered device:";
-        content += "<p>";
-        content += "</p><form method='get' action='devicename'>";
-        content += "<label>SCS address: </label><input name='busid' maxlength=2 value='";
-        content += String(nomeDevice);
-        content += "' style='width:40px'>\
-            <label>  type: </label><input name='type' maxlength=10 value='";
-        content += TypeDescr;
-        content += "' style='width:80px'> ";
-
-        content += "<label> max position (0,1 sec):</label><input name='maxpos' maxlength=6 value='";
-        content += temp;
-        content += "' style='width:45px'>";
-
-        content += "<label> name:</label><input name='devname' maxlength=20 value='";
-        content += AlexaDescr;
-        content += "' style='width:200px'>";
-
-        content += "<label> alexa ref.:</label><input name='alexaind' maxlength=3 value='";
-
-
-      //  content += ...............    da fauxmo.addDevice
-
-        char sAlex[4];
-        if (device_BUS_id[deviceX].alexa_id)
-        {
-          sprintf(sAlex, "%d", device_BUS_id[deviceX].alexa_id);
-          content += sAlex;
-        }
-        else
-          content += "no";
-          
-        content += "' style='width:40px'>";
-
-        content += "<input type='submit'>";
-        content += EndMsg;
-
-        if ((devtype <= 0) || (devtype > 31))
-        {
-          sprintf(temp, "<li>END OF %d discovered devices</li>", deviceX);
-          content += temp;
-          content += "</li>";
-          device = 0;
-          deviceX = 0;
-          WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-          EEPROM.commit();
-        }
-        content += "</form> </html>";
-
-        request->send(200, "text/html", content);
-        content = "";
-// =============================================================================================
-    });
-
 
 
 
@@ -5108,7 +3985,8 @@ char BufferSearch(void)
    return 255;
 }
 // =====================================================================================================
-// =====================================================================================================
+// ===============================SCRITTURA UART DAL DOPPIO BUFFER======================================
+// ==================================COMANDI ALEXA==non loggata=========================================
 char SendToPIC(char bufNr)
 {
    char len = serOlen[bufNr];
@@ -5197,7 +4075,6 @@ char SendToPIC(char bufNr)
 }  
 
 
-
 // =====================================================================================================
 // =====================================================================================================
 void ConnectToRouter(String esid, String epass)
@@ -5205,13 +4082,27 @@ void ConnectToRouter(String esid, String epass)
 // =========================================================================================
 //        CONNESSIONE  AL  ROUTER 
 // =========================================================================================
-#ifdef LOWPOWER
+
+  WiFi.disconnect(false, true); // Pulisce eventuali sessioni salvate corrotte
+  WiFi.mode(WIFI_STA);
+
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-#endif
-WiFi.begin(esid.c_str(), epass.c_str());   
-#ifdef LOWPOWER
+  // 2. Evita blocchi nella negoziazione WPA2/WPA3
+  WiFi.setMinSecurity(WIFI_AUTH_WPA2_PSK);
+
+  // 3. Configura PMF (Protected Management Frames) come opzionale (non obbligatorio)
+  wifi_config_t wifi_config;
+  esp_wifi_get_config(WIFI_IF_STA, &wifi_config);
+  wifi_config.sta.pmf_cfg.capable = true;
+  wifi_config.sta.pmf_cfg.required = false;
+  esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
-#endif
+
+  WiFi.begin(esid.c_str(), epass.c_str());   
+
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+
   // =========================================================================================
 
     if ((local_ip[0] > 0) && (local_ip[0] < 255))
@@ -5232,7 +4123,8 @@ WiFi.begin(esid.c_str(), epass.c_str());
 
     if (testWifi())   // wifi connesso
     {
-      Serial1.write('@');   // set led lamps
+      Serial1.write(PIC_REQ);   // set led lamps
+//      Serial1.write('@');   // set led lamps
       Serial1.write(0xF1);  // set led lamps std-freq (client mode)
 
       WiFi.mode(WIFI_STA);
@@ -5276,25 +4168,34 @@ WiFi.begin(esid.c_str(), epass.c_str());
 
         id_interfaccia_scs_knx = fauxmo.addDevice(ID_MY, 0);
         
-        char devtype;
-        char devx = 1;
-        while ((devx < DEV_NR) && (device_BUS_id[devx].addressW))
+        uint8_t devtype;
+        uint8_t devx = 1;
+        for (devx = 0; devx < MY_ENTITA; devx++)
         {
-          devtype = device_BUS_id[devx].deviceType;
-          if ((devtype > 0) && (devtype != 11) && (devtype < 18))  // W6 - in alexa censire solo indirizzi base
+          if (sistema_scs.elenco[devx].valido == 1)
           {
-            String edesc = descrOfIx(devx);
-            if ((edesc != "") && (edesc[0] > ' '))
-            {
-              if (devtype == 9)
-                id_fauxmo = fauxmo.addDevice(&edesc[0], 1);
-              else
-                id_fauxmo = fauxmo.addDevice(&edesc[0], 128);
+              devtype = sistema_scs.elenco[devx].tipo_codice;
+              if ((devtype > 0) && (devtype != 11) && (devtype < 18))  // W6 - in alexa censire solo indirizzi base
+              {
+                  if (devtype == 9)
+                    id_fauxmo = fauxmo.addDevice(sistema_scs.elenco[devx].descrizione, 1);
+                  else
+                    id_fauxmo = fauxmo.addDevice(sistema_scs.elenco[devx].descrizione, 128);
                 
-              alexa_BUS_ix[id_fauxmo] = devx;  // index: device id alexa max DEV_NR devices    data: ID bus reale
-              device_BUS_id[devx].alexa_id = id_fauxmo; 
-            }
-            devx++;
+                  alexa_BUS_ix[id_fauxmo] = devx;  // index: device id alexa max MY_ENTITA devices    data: ID bus reale
+                  sistema_scs.elenco[devx].alexa_id = id_fauxmo; 
+/*
+                  if (events.count() != 0) 
+                  {
+                      char buflog[128];
+              		  String tipo_str = codifica_codice_a_tipo(sistema_scs.elenco[i].tipo_codice); 
+                      sprintf(buflog,"[%d] [scs] %d, id: %02X, %s, %s, st: %s, val: %d, AX=%02X",
+                        (millis()/100), i, sistema_scs.elenco[i].id, tipo_str, 
+                        sistema_scs.elenco[i].descrizione, sistema_scs.elenco[i].stato, sistema_scs.elenco[i].valido, sistema_scs.elenco[i].alexa_id);
+                      events.send(buflog, "log", millis());
+                  }
+*/
+              }
           }
         }
         // ----------------------------------------------------------------------------------------------------
@@ -5306,7 +4207,6 @@ WiFi.begin(esid.c_str(), epass.c_str());
         Serial.printf("[START] %d fauxmo devices added\r\n", id_fauxmo + 1);
         Serial.printf("[START] Free heap: %d bytes\r\n", ESP.getFreeHeap());
 #endif
-
 
 
 
@@ -5374,11 +4274,9 @@ WiFi.begin(esid.c_str(), epass.c_str());
           else // an scs/knx device
           {
             char devix = alexa_BUS_ix[alexa_id];
-            char devtype = device_BUS_id[devix].deviceType;
-//          char device = alexa_BUS_id[alexa_id];
-            
+            char devtype = sistema_scs.elenco[devix].tipo_codice;
 #ifdef DEBUG
-            Serial.printf("\r\n-       device " _MODO " %02X - type: %02X ", device_BUS_id[devix].address, devtype);
+            Serial.printf("\r\n-       device " _MODO " %02X - type: %02X ", de[devix].address, devtype);
 #endif
 
             // If your device state is changed by any other means (MQTT, physical button,...)
@@ -5390,7 +4288,7 @@ WiFi.begin(esid.c_str(), epass.c_str());
               unsigned char command;
               int pct;
               char stato = fauxmo.getState(alexa_id);
-              char device = device_BUS_id[devix].address;
+              char device = sistema_scs.elenco[devix].id;
               switch (devtype)
               {
                 // --------------------------------------- SWITCHES -------------------------------------------
@@ -5412,7 +4310,7 @@ WiFi.begin(esid.c_str(), epass.c_str());
                   serObuffer[bufNr][serOlen[bufNr]++] = 'y';  // 0x79 (@y: invia a pic da ALEXA cmd standard da inviare sul bus)
 
 // comando §y<destaddress><source><type><command>
-                  serObuffer[bufNr][serOlen[bufNr]++] = device_BUS_id[devix].address;     // to   device address
+                  serObuffer[bufNr][serOlen[bufNr]++] = sistema_scs.elenco[devix].id;     // to   device address
                   serObuffer[bufNr][serOlen[bufNr]++] = 0x00;       // from device
                   serObuffer[bufNr][serOlen[bufNr]++] = 0x12;       // command type
                   serObuffer[bufNr][serOlen[bufNr]++] = command;    // command char
@@ -5557,7 +4455,8 @@ WiFi.begin(esid.c_str(), epass.c_str());
           Serial.println ( "UDP open ERROR" );
 #endif
       }
-      Serial1.write('@');   // set led lamps
+      Serial1.write(PIC_REQ);   // set led lamps
+//      Serial1.write('@');   // set led lamps
       Serial1.write(0xF1);  // set led lamps std-freq (client mode)
 
 
@@ -5588,9 +4487,8 @@ WiFi.begin(esid.c_str(), epass.c_str());
 
 
 // =====================================================================================================
-// =====================================================================================================
-// -----------------------------------------------------------------------------------------------------------------------------------------------
 void setup() {
+// =====================================================================================================
 
   char forceAP = 0;
   char jumperOpen;
@@ -5730,47 +4628,6 @@ void setup() {
     forceAP = 1;
   }
 
-/*
-// ------------- 's' : SPEED test  ------------------------------------
-  if (serIniOption == 's')
-  {
-    int32_t time1;
-//  char ixOfDevice(DEVADDR device)
-//    unsigned long last = millis();
-     
-    DEVADDR dtest;
-    dtest.linesector = 0x44;
-    dtest.address = 0x55;
-
-    char xa = 0;
-    while (xa < DEV_NR)
-    {
-      device_BUS_id[xa].linesector = 11;
-      device_BUS_id[xa].address = 22;
-      device_BUS_id[xa].deviceType = 1;
-      xa++;
-    }
-    // test search table speed with ixofdevices()
-    time1 = asm_ccount();
-    int nts = 0;
-    int lups =0;
-    char tst;
-    while (nts < 1000)
-    {
-      tst = ixOfDevice((DEVADDR)dtest);
-      nts++;
-    }
-    int32_t time2;
-    lups = nts;
-    time2 = asm_ccount();
-//    Serial.printf("\r\n- table search (1000 devcs): %d mS\r\n", (millis() - last)); // 
-    Serial.printf("\r\ns: - table search (%d devcs): %d tcks\r\n", lups, time2 - time1); //     
-    Serial.printf(" - %d uS\r\n", (time2 - time1)/80); //     
-    time2 = asm_ccount();
-    Serial.printf("\r\n- table search (%d devcs): %d tcks\r\n", lups, time2 - time1); //     
-    Serial.printf(" - %d uS\r\n", (time2 - time1)/80); //     
-  }
-*/
 
 
 // ------------- 'a' : AP mode ----------------------------------------
@@ -5790,98 +4647,7 @@ void setup() {
     Serial.println("r: router (client) mode");
 #endif
   }
-#ifdef FFS
-/*  --------------------------------------------------------- test spiffs --------------------------------
-#ifdef VERBOSE
-  if (serIniOption == 'f')
-  {
-    Serial.println("f: test spiffs");
-    if (SPIFFS.begin()) 
-    {
-      Serial.println("SPIFFS Active");
-      Serial.println();
-
-    } else 
-    {
-      Serial.println("Unable to activate SPIFFS");
-    }
-
-    String str = "";
-    Dir dir = SPIFFS.openDir("/");   
-    while (dir.next()) {
-      str += dir.fileName();
-      str += " / ";
-      str += dir.fileSize();
-      str += "\r\n";
-    }
-    Serial.print(str);
-
-    String path = "/version.txt";
-    Serial.println("handleFileRead: " + path);
-
-    if (SPIFFS.exists(path)) 
-    {
-      File f = SPIFFS.open(path, "r");
-      if (!f) {
-        Serial.print("Unable To Open '");
-        Serial.print(path);
-        Serial.println("' for Reading");
-        Serial.println();
-      } else {
-        String s;
-        Serial.print("Contents of file '");
-        Serial.print(path);
-        Serial.println("'");
-        Serial.println();
-        while (f.position()<f.size())
-        {
-          s=f.readStringUntil('\n');
-          s.trim();
-          Serial.println(s);
-        } 
-        f.close();
-      }
-      Serial.println();
-    }
-    else 
-      Serial.println("/version.txt not found");
-    
-    path = PICPATH;
-    Serial.println("handleFileRead: " + path);
-
-    if (SPIFFS.exists(path)) 
-    {
-      File f = SPIFFS.open(path, "r");
-      if (!f) {
-        Serial.print("Unable To Open '");
-        Serial.print(path);
-        Serial.println("' for Reading");
-        Serial.println();
-      } else {
-        String s;
-        Serial.print("Contents of file '");
-        Serial.print(path);
-        Serial.println("'");
-        Serial.println();
-        
-        char buffer[20];
-        s=f.readBytes(buffer, 16);
-        Serial.printf("%02X %02X %02X %02X  %02X %02X %02X %02X", buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7]);
-        
-        f.close();
-      }
-      Serial.println();
-    }
-    else 
-      Serial.println(PICPATH " not found");
-        
-    SPIFFS.end();
-  }
-#endif
-*/  
-#endif
 // -----------------------------------------------------------------------------------------------------------
-
 
   Serial1.write('@');    // 
   Serial1.write(0xF0);   // set led lamps low-freq (in progress mode)
@@ -5975,9 +4741,6 @@ void setup() {
   Serial.println(mqtt_persistence);
 #endif
 
-  ReadStream((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN, 0);  // tipo=0 binary   1:ascii
-
-
   Serial1.write('@');    // 
   Serial1.write(0xF0);   // set led lamps low-freq (in progress mode)
   delay(10);            // wait 10ms
@@ -6002,9 +4765,11 @@ void setup() {
 #endif
 
   setFirst();
+  internal = 1;
   delay(50);            // wait 50ms
 
-  Serial1.write("@b");   // clear SCSgate/KNXgate buffer
+  Serial1.write(PIC_REQ);   // set led lamps
+  Serial1.write('b');   // clear SCSgate/KNXgate buffer
   Serial1.setTimeout(10); // timeout is 10mS
   delay(50);           // wait 50ms
   Serial1.flush();
@@ -6042,7 +4807,7 @@ void setup() {
   Serial.println(udpLocalPort);
 #endif
 
-
+  inizializza_e_leggi_dispositivi_preferences();
 
   if ((serIniOption != 'a') && (esid.length() > 1 ))
 // =========================================================================================
@@ -6050,10 +4815,14 @@ void setup() {
 // =========================================================================================
   {
 	  ConnectToRouter(esid, epass);
+      setFirst();
+      internal = 1;
+      prev_internal = 5;
   }
   else
   {
-    Serial1.write('@');   // set led lamps
+//    Serial1.write('@');   // set led lamps
+    Serial1.write(PIC_REQ);   // set led lamps
     Serial1.write(0xF2);  // set led lamps high-freq (AP mode)
     // =================================================================================================
     // access point mode
@@ -6064,10 +4833,10 @@ void setup() {
     else
 #endif
     setupAP(0);
-    Serial1.write('@');   // set led lamps
+    Serial1.write(PIC_REQ);   // set led lamps
+//    Serial1.write('@');   // set led lamps
     Serial1.write(0xF2);  // set led lamps high-freq (AP mode)
   }
-
 
 
       // ==================================== OTA startup ================================================
@@ -6105,7 +4874,6 @@ void setup() {
         immediateSend();
 
         ArduinoOTAflag = 1;
-        WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
         EEPROM.commit();
       });
 
@@ -6437,11 +5205,1375 @@ void PicProg(void)
    }
 }
 #endif
-// =====================================================================================================
-// DEVADDR device_BUS_id[DEV_NR]; // pointer: eventuale id alexa - contenuto: device address reale (scs o knx) e tipo
+
+
+
+
+
+
+
+// **************************************************************************************************++
+
+
+uint8_t scs_tratta_messaggi_per_mqtt(void)
+{
+  //    [F3] u <address> <position%>
+  if ((replyLen == 4) && (replyBuffer[0] == 0xF3))    
+  { // replyLen==4 && replyBuffer == 0xF3 'u'
+    uint8_t device = replyBuffer[2];
+    int pct = replyBuffer[3];
+//    uint8_t devx = CercaAddress(device);
+   
+#ifdef TRACE_SSE
+  char buflog[120];
+  sprintf(buflog, "[TRC} tap/dimm mqtt:  %c ", replyBuffer[1]);
+  events.send(buflog, "log", millis());
+#endif
+    
+	if (replyBuffer[1] == 'u')    //'u': posizione tapparelle//
+		// ----------------uab-(address position)--- PUBBLICAZIONE STATO COVERPCT -------------------------------------------------------
+	{ // pubblicazione posizione coverpct   
+		char actionc[6];
+
+		sprintf(actionc, "%03u", pct);     // position
+		char nomeDevice[5];
+		sprintf(nomeDevice, "%02X", device);  // device
+		String topic = COVERPCT_STATE;
+		topic += nomeDevice;
+		const char* cTopic = topic.c_str();
+		client.publish(cTopic, actionc, mqtt_persistence);
+	}  // 'u'
+	else
+    if (replyBuffer[1] == 'm')    //'m': posizione dimmer//
+    {
+#ifdef TRACE_SSE
+  char buflog[120];
+  sprintf(buflog, "[TRC} dimmer position");
+  events.send(buflog, "log", millis());
+#endif
+    // ----------------uab-(address position)--- PUBBLICAZIONE STATO DIMMER -------------------------------------------------------
+        char actionc[6];
+
+        sprintf(actionc, "%03u", pct);     // position
+        char nomeDevice[5];
+        sprintf(nomeDevice, "%02X", device);  // device
+        String topic = BRIGHT_STATE;
+        topic += nomeDevice;
+        const char* cTopic = topic.c_str();
+        client.publish(cTopic, actionc, mqtt_persistence);
+    }    
+	return 0;    
+  } // replyLen==4 - 5  && replyBuffer == 0xF3-F4
+    
+  else
+  // --------SCS-----4abcd-(from-to-type-cmd)------- PUBBLICAZIONE STATO DEVICES -------------------------------------------------------
+
+  if ((replyBuffer[1] == 'y') && ((replyBuffer[0] == 0xF5) || (replyBuffer[0] == 0xF6)))
+  { // START pubblicazione stato device        [0xF5] [y] 32 00 12 01
+#ifdef TRACE_SSE
+  char buflog[120];
+  sprintf(buflog, "[TRC} mqtt state %d  - cmd %02X", mqttopen, replyBuffer[4]);
+  events.send(buflog, "log", millis());
+#endif
+    char devtype;
+    char action;
+    String topic = "NOTOPIC";
+    String payload = "";
+
+    // ================================ C O M A N D I     S C S ===========================================
+
+    // SCS intero   [7] A8 32 00 12 01 21 A3
+    // SCS ridotto [0xF5] [y] 32 00 12 01
+    //  termostato [0xF5] [y] B4 01 30 F4      @yb46530f4  SENSORE
+
+    uint8_t devx = 0;
+    uint8_t device;
+    if (replyBuffer[4] == 0x30)  // <-termostato-----------------------
+    {
+		if ((replyBuffer[2] == 0xB4) || (replyBuffer[2] == 0xB5))  // <-temperatura rilevata-----B4 zz 30 tt-----B5 zz 30 tt-----------
+		{
+			device = replyBuffer[3];  
+//			devtype = 15;
+			devtype = 0;
+
+			const char* cPayload;
+			const char* cTopic;
+			char nomeDevice[5];
+			sprintf(nomeDevice, "%02X", device);  // to
+			topic = SENSOR_TEMP_STATE;
+			topic += nomeDevice;
+
+			char actionc[5];
+			if (replyBuffer[2] == 0xB5)
+			  sprintf(actionc, "%03u", (255 + replyBuffer[5])); 
+			else
+			  sprintf(actionc, "%03u", replyBuffer[5]); 
+			actionc[4]=0;
+			actionc[3]= actionc[2];
+			actionc[2]=',';
+			payload = String(actionc);
+	        
+			cPayload = payload.c_str();
+			cTopic = topic.c_str();
+			client.publish(cTopic, cPayload, mqtt_persistence);
+		}
+#ifdef TERMO_NEW
+		else
+		if ((replyBuffer[2] == 0x90) || (replyBuffer[2] == 0x91)) // setup temperatura --estate/inverno---- 90/91 0z 30 tt  (x5)
+		{																   
+			device = replyBuffer[3];  
+			devtype = 0;
+
+			const char* cPayload;
+			const char* cTopic;
+			char nomeDevice[5];
+			sprintf(nomeDevice, "%02X", device);  // to
+			topic = "scs/sensor/temp/setup/";
+			topic += nomeDevice;
+
+			char actionc[5];
+			sprintf(actionc, "%03u", (5 * replyBuffer[5])); 
+			actionc[4]=0;
+			actionc[3]= actionc[2];
+			actionc[2]=',';
+			payload = String(actionc);
+	        
+			cPayload = payload.c_str();
+			cTopic = topic.c_str();
+			client.publish(cTopic, cPayload, mqtt_persistence);
+		}
+		else
+		if (replyBuffer[2] == 0xB7)  // stato sonda ------ B7 zz 30 Fx
+		{
+			device = replyBuffer[3];  
+			devtype = 0;
+
+			const char* cPayload;
+			const char* cTopic;
+			char nomeDevice[5];
+			sprintf(nomeDevice, "%02X", device);  // to
+			topic = "scs/sonda/state/";
+			topic += nomeDevice;
+
+			char actionc[20];
+			switch (replyBuffer[5])
+			{
+// es. device	04 : zona 4	stato sonda    f0	(riscaldamento)	f1	(condizionamento)	f2	(antigelo)	f3	(protezione termica)	ff	(off)
+			case 0xf0:
+				payload = "riscaldamento";
+				break;
+			case 0xf1:
+				payload = "condizionamento";
+				break;
+			case 0xf2:
+				payload = "antigelo";
+				break;
+			case 0xf3:
+				payload = "protezione";
+				break;
+			case 0xff:
+				payload = "off";
+				break;
+			default:
+				payload = "";
+				break;
+			}
+			if (payload[0] != 0)
+			{
+				cPayload = payload.c_str();
+				cTopic = topic.c_str();
+				client.publish(cTopic, cPayload, mqtt_persistence);
+			}
+		}
+#endif
+	}
+#ifdef TERMO_NEW
+	else
+	if ((replyBuffer[2] == 0xB7) && (replyBuffer[4] == 0x31))          // stato attuatore --inverno---- B7 8z 31 0x
+	{																   // stato fancoil   --inverno---- B7 8z 31 2x
+		device = replyBuffer[3];  
+		device &= 0x0F;
+		devtype = 0;
+
+		const char* cPayload;
+		const char* cTopic;
+		char nomeDevice[5];
+		sprintf(nomeDevice, "%02X", device);  // to
+		topic = "scs/actuator/state/";
+		topic += nomeDevice;
+
+		char actionc[32];
+		switch (replyBuffer[5])
+		{
+		case 0x00:
+			payload = "inverno - acceso";
+			break;
+		case 0x01:
+			payload = "inverno - spento";
+			break;
+		default:  
+			payload = "";
+			break;
+		}
+		if (payload[0] != 0)
+		{
+			cPayload = payload.c_str();
+			cTopic = topic.c_str();
+			client.publish(cTopic, cPayload, mqtt_persistence);
+		}
+		else
+		{
+			topic = "scs/fancoil/state/";
+			topic += nomeDevice;
+			switch (replyBuffer[5])
+			{
+			case 0x20:
+				payload = "inverno - spento";
+				break;
+			case 0x21:
+				payload = "inverno - vel. 1";
+				break;
+			case 0x22:
+				payload = "inverno - vel. 2";
+				break;
+			case 0x23:
+				payload = "inverno - vel. 3";
+				break;
+			default:
+				payload = "off";
+				break;
+			}
+			if (payload[0] != 0)
+			{
+				cPayload = payload.c_str();
+				cTopic = topic.c_str();
+				client.publish(cTopic, cPayload, mqtt_persistence);
+			}
+		}
+	}
+	else
+	if ((replyBuffer[2] == 0xB7) && (replyBuffer[4] == 0x32))          // stato attuatore --estate---- B7 8z 31 0x
+	{																   // stato fancoil   --estate---- B7 8z 31 2x
+		device = replyBuffer[3];  
+		device &= 0x0F;
+		devtype = 0;
+
+		const char* cPayload;
+		const char* cTopic;
+		char nomeDevice[5];
+		sprintf(nomeDevice, "%02X", device);  // to
+		topic = "scs/actuator/state/";
+		topic += nomeDevice;
+
+		char actionc[32];
+		switch (replyBuffer[5])
+		{
+		case 0x00:
+			payload = "estate - acceso";
+			break;
+		case 0x01:
+			payload = "estate - spento";
+			break;
+		default:
+			payload = "";
+			break;
+		}
+		if (payload[0] != 0)
+		{
+			cPayload = payload.c_str();
+			cTopic = topic.c_str();
+			client.publish(cTopic, cPayload, mqtt_persistence);
+		}
+		else
+		{
+			topic = "scs/fancoil/state/";
+			topic += nomeDevice;
+
+			switch (replyBuffer[5])
+			{
+			case 0x20:
+				payload = "estate - spento";
+				break;
+			case 0x21:
+				payload = "estate - vel. 1";
+				break;
+			case 0x22:
+				payload = "estate - vel. 2";
+				break;
+			case 0x23:
+				payload = "estate - vel. 3";
+				break;
+			default:
+				payload = "off";
+				break;
+			}
+			if (payload[0] != 0)
+			{
+				cPayload = payload.c_str();
+				cTopic = topic.c_str();
+				client.publish(cTopic, cPayload, mqtt_persistence);
+			}
+		}
+	}
+#endif
+    else
+    if (replyBuffer[4] == 0x12)  // <-comando----------------------------
+    {
+      action = replyBuffer[5];
+      if (replyBuffer[2] == 0xB1)   // <------------ indirizzato a TUTTI i devices
+      {
+        char nomeDevice[4];
+        String topicPfx;
+        const char* cPayload;
+        const char* cTopic;
+        char typeAll = 99;
+        switch (action)
+        {
+          case 0:
+            typeAll = 1;
+            payload = "ON";
+            topicPfx = SWITCH_STATE;
+            break;
+          case 1:
+            typeAll = 1;
+            payload = "OFF";
+            topicPfx = SWITCH_STATE;
+            break;
+          case 8:
+            typeAll = 8;
+            if ((domoticMode == 'h') || (domoticMode == 'H'))
+                payload = "open";
+            else
+                payload = "OFF";
+            topicPfx = COVER_STATE;
+            break;
+          case 9:
+            typeAll = 8;
+            if ((domoticMode == 'h') || (domoticMode == 'H'))
+                payload = "closed";
+            else
+                payload = "ON";
+            topicPfx = COVER_STATE;
+            break;
+          case 0x0A:
+            typeAll = 8;
+            payload = "STOP";
+            topicPfx = COVER_STATE;
+            break;
+        }  // end switch 
+        for (devx = 1; devx < MY_ENTITA; devx++)
+        {
+            if (sistema_scs.elenco[devx].valido == 1)
+            {
+              devtype = sistema_scs.elenco[devx].tipo_codice;
+              if (((typeAll == 1) && (devtype == DIMMER))  // dimmer
+                || (typeAll == devtype))  // switch - cover
+              {
+                strncpy(nomeDevice, sistema_scs.elenco[devx].address, 2);  // to
+                topic = topicPfx;
+                topic += nomeDevice;
+            
+#ifdef USE_TCPSERVER
+                if ((tcpuart == 2) && (tcpclient) && (tcpclient.connected())) 
+                {
+                  String log = "\r\npub: ";
+                  log += topic;
+                  log += " ";
+                  log += payload;
+                  tcpclient.write((char*)&log[0], log.length());
+                  tcpclient.flush(); 
+                }
+    //          else
+#endif
+                {
+                  cPayload = payload.c_str();
+                  cTopic = topic.c_str();
+                  client.publish(cTopic, cPayload, mqtt_persistence);
+                }
+              }     //endif dimmer cover
+            }   // end valido
+        }   // end for devx
+        device = 0;
+        devtype = 0;
+      }                            // <------------ indirizzato a TUTTI i devices
+      else
+      {
+        if (replyBuffer[2] < 0xB0)
+          device = replyBuffer[2];  // to
+        else
+          device = replyBuffer[3];  // from
+      }
+
+
+
+      if ((action == 0) || (action == 1))       // switch
+        devtype = LUCE;
+      else if ((action == 3) || (action == 4))      // dimmer
+        devtype = 0; // sono solo richieste di +/- , poi arrivera' l'intensita'
+      else if ((action == 0x08) || (action == 0x09) || (action == 0x0A))   // cover
+        devtype = TAPPARELLA;
+      else if ((action & 0x0F) == 0x0D) // da 0x1D a 0x9D
+      {
+        devtype = DIMMER;
+        action >>= 4;
+        action *= 10;	// percentuale 10-90
+
+        // --------------- percentuale da 1 a 255 (home assistant) ----------------
+        //         if (domoticMode == 'h')   // h=as homeassistant
+        {
+          int pct = action;
+          pct *= 255;      // da 0 a 25500
+          pct /= 100;      // da 0 a 100
+          action = (char) pct;
+        }
+      }
+      else
+        devtype = 0;
+
+
+
+
+
+      if ((device != 0) && (devtype != 0))
+      //      if ((device != 0) && (devtype != 0) && ((device != prevDevice) || (action != prevAction)))
+      { // device valido & evitare doppioni
+        prevDevice = device;
+        prevAction = action;
+
+        char nomeDevice[5];
+        sprintf(nomeDevice, "%02X", device);  // to
+
+      // ----------------------------------------- STATO SWITCH --------------------------------------------
+        if (devtype == LUCE)
+        {
+          if (action == 0)
+          {
+            payload = "ON";
+          }
+          else if (action == 1)
+          {
+            payload = "OFF";
+          }
+          topic = SWITCH_STATE;
+          topic += nomeDevice;
+        }
+        else
+        // ----------------------------------------- STATO DIMMER --------------------------------------------
+        if ((devtype == DIMMER) ||(devtype == 4))
+        {
+          char actionc[4];
+          sprintf(actionc, "%02u", action);
+          payload = String(actionc);
+          topic = BRIGHT_STATE;
+          topic += nomeDevice;
+        }
+        else
+        // ----------------------------------------- STATO COVER --------------------------------------------
+        if ((devtype == TAPPARELLA) || (devtype == 18))
+        {
+          if (action == 0x08)
+          {
+            if ((domoticMode == 'h') || (domoticMode == 'H'))
+              payload = "open";
+            else
+              payload = "OFF";
+          }
+          else if (action == 0x09)
+          {
+            if ((domoticMode == 'h') || (domoticMode == 'H'))
+              payload = "closed";
+            else
+              payload = "ON";
+          }
+          else if (action == 0x0A)
+          {
+            payload = "STOP";
+          }
+
+          topic = COVER_STATE;
+          topic += nomeDevice;
+        } // devtype=8
+  // ----------------------------------------------------------------------------------------------------
+
+
+    // ======================================== P U B B L I C A Z I O N E ===========================================
+          const char* cTopic = topic.c_str();
+          
+          
+#ifdef USE_TCPSERVER
+          if ((tcpuart == 2) && (tcpclient) && (tcpclient.connected())) 
+          {
+            String log = "\r\npub: ";
+            log += topic;
+            log += " ";
+            log += payload;
+            tcpclient.write((char*)&log[0], log.length());
+            tcpclient.flush(); 
+          }
+#endif
+          
+          if (payload == "")
+          {
+              char cPayload[24];
+              sprintf(cPayload, "UNKNOWN: %02X %02X %02X %02X", replyBuffer[1], replyBuffer[2], replyBuffer[3], replyBuffer[4]);  // to
+              client.publish(cTopic, cPayload, 0);
+          }
+          else
+          {
+              const char* cPayload = payload.c_str();
+              client.publish(cTopic, cPayload, mqtt_persistence);
+          }
+      }       // evitare doppioni & device valido
+    } // <-replyBuffer[4] == 0x12---------------------comando----------------------------
+  // ----------------------------------------------------------------------------------------------------
+    else
+      
+      
+      
+  // ----------------------------------pubblicazione stati GENERIC device SCS (to & from)------------------------
+      { // generic device
+
+          device = replyBuffer[2];            // TO
+          devx = CercaAddress(device);
+          
+          if ((devx != 0xFF) && (sistema_scs.elenco[devx].tipo_codice == GENERICO))  
+          {	          // device generic censito
+            topic = GENERIC_TO;
+            topic += sistema_scs.elenco[devx].address;
+            const char* cTopic = topic.c_str();
+            char cPayload[8];
+          
+#ifdef USE_TCPSERVER
+            if ((tcpuart == 2) && (tcpclient) && (tcpclient.connected())) 
+            {
+              String log = "\r\npub: ";
+              log += topic;
+              log += " ";
+              log += payload;
+              tcpclient.write((char*)&log[0], log.length());
+              tcpclient.flush(); 
+            }
+#endif
+          
+            sprintf(cPayload, "%02X%02X%02X", replyBuffer[3], replyBuffer[4], replyBuffer[5]);
+            client.publish(cTopic, cPayload, mqtt_persistence);
+          }
+
+          device = replyBuffer[3];            // FROM
+          devx = CercaAddress(device);
+          if ((devx != 0xFF) && (sistema_scs.elenco[devx].tipo_codice == GENERICO))  
+          {	          // device generic censito
+            topic = GENERIC_FROM;
+            topic += sistema_scs.elenco[devx].address;
+            const char* cTopic = topic.c_str();
+            char cPayload[24];
+            sprintf(cPayload, "%02X%02X%02X", replyBuffer[2], replyBuffer[4], replyBuffer[5]);
+            client.publish(cTopic, cPayload, mqtt_persistence);
+          }
+
+      } // generic device
+	return 1;
+}
+	return 1;
+}
+
+
+
+
+
+
+
 // =====================================================================================================
 
 
+#ifdef MY_DOMOTIC
+// MY_DOMOTIC_NEW
+
+
+void scs_tratta_messaggi_per_my_domotic_B1(uint8_t des, uint8_t cmd, uint8_t arg)
+{
+    char actionc[16];
+    String payload = "";
+    int valore = -1;
+/*
+    uint8_t des  = replyBuffer[2]; // Destinazione (es. 0x32, 0x91, 0xB4, 0xB5...)
+    uint8_t prov = replyBuffer[3]; // Provenienza / Zona (es. 0x01, 0x02...)
+    uint8_t cmd  = replyBuffer[4]; // Tipo di comando (es. 0x12 o 0x30)
+    uint8_t arg  = replyBuffer[5]; // Argomento reale (es. 0x00, 0x01, 0xF4...)
+*/
+    if ((des == 0xB1) && (cmd == 0x12))   // <------------ indirizzato a TUTTI i devices
+    {
+      char typeAll = 0;
+      switch (arg)
+      {
+        case 0:
+          typeAll = 1;
+          payload = "ON";
+          break;
+        case 1:
+          typeAll = 1;
+          payload = "OFF";
+          break;
+        case 8:
+          typeAll = 8;
+          payload = "SALITA";
+          break;
+        case 9:
+          typeAll = 8;
+          payload = "DISCESA";
+          break;
+        case 0x0A:
+          typeAll = 8;
+          payload = "STOP";
+          break;
+        default:
+          if ((arg & 0x0F) == 0x0D) // da 0x1D a 0x9D
+          {
+            typeAll = 3;
+            arg >>= 4;
+            arg *= 10;	// percentuale 10-90
+            sprintf(actionc, "%02u", arg);
+            valore = arg;
+          }
+          break;
+      }
+//uint8_t corrispondenza[5] = {LUCE,TERMOSTATO,DIMMER,TAPPARELLA,TAPPARELLA_PCT};
+//enum TipoEntita { ENTI_INTERRUTTORE, ENTI_SENSORE, ENTI_SLIDER, ENTI_TAPPARELLA, ENTI_TAPPARELLA_PCT };
+#ifdef TRACE_SSE
+    char buflog[120];
+	  sprintf(buflog, "[TRC} domotic new  - msg B1: typeAll %d", typeAll);
+	  events.send(buflog, "log", millis());
+#endif
+
+      for (int i = 0; i < MY_ENTITA; i++) 
+      {
+          if (((typeAll == 1)  // on/off
+                && (sistema_scs.elenco[i].tipo_codice == LUCE))
+          ||  ((typeAll == 8)  // up/down/stop
+                && ((sistema_scs.elenco[i].tipo_codice == TAPPARELLA) || (sistema_scs.elenco[i].tipo_codice == TAPPARELLA_PCT))))
+          {                
+             strcpy(sistema_scs.elenco[i].stato, payload.c_str());
+			       if (eventity.count() != 0)
+	               eventity.send(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address, millis());
+#ifdef DEBUG_EVENTITY
+  String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + String(sistema_scs.elenco[i].address) + " : " + payload;
+  events.send(rispostaLog.c_str(), "log", millis());
+#endif
+          }
+          else
+          if ((typeAll == 1)  // on/off
+                && (sistema_scs.elenco[i].tipo_codice == DIMMER))
+          {                
+            strcpy (sistema_scs.elenco[i].stato, payload.c_str());
+			if (eventity.count() != 0)
+	            eventity.send(String(sistema_scs.elenco[i].stato) + "|" + String(sistema_scs.elenco[i].valore_corrente), String(sistema_scs.elenco[i].address), millis());
+
+#ifdef DEBUG_EVENTITY
+  String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + sistema_scs.elenco[i].id + " : " + payload;
+  events.send(rispostaLog.c_str(), "log", millis());
+#endif
+          }
+        }
+	}
+}
+
+
+
+
+
+
+
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+void sse_ha_update(const char * stato, const char * id)
+{
+#ifdef DEBUG_EVENTITY
+    String rispostaLog = "[" + String(millis()/100) + "s] [CMD] === id: " + id + " : " + stato;
+    events.send(rispostaLog.c_str(), "log", millis());
+#endif
+	if (eventity.count() != 0)
+		eventity.send(stato, id, millis());
+}
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+void invia_nuova_card_info_sse(int indx) {
+	if (eventity.count() == 0) return;
+
+    int8_t p_info = sistema_scs.elenco[indx].ptr_info;
+    if (p_info < 0 || p_info >= MAX_INFO) return;
+
+	char payload[256];
+	snprintf(payload, sizeof(payload), 
+		"{\"id\": \"%s_INF\",\"nome\": \"%s (info)\",\"tipo\":5,\"stato\": \"%s|%s|%s|%s|%s\"}", 
+         sistema_scs.elenco[indx].address,
+		 sistema_scs.elenco[indx].descrizione,
+         cardinfo[p_info].info_0,
+         cardinfo[p_info].info_1,
+         cardinfo[p_info].info_2,
+         cardinfo[p_info].info_3,
+         cardinfo[p_info].info_4);
+		 
+#ifdef DEBUG_EVENTITY
+    String rispostaLog = "[" + String(millis()/100) + "s] [CMD] ==NEW_CARD== " + payload;
+    events.send(rispostaLog.c_str(), "log", millis());
+#endif
+	if (eventity.count() != 0)
+	{
+		eventity.send(payload, "NEW_CARD", millis());
+		vTaskDelay(pdMS_TO_TICKS(200));
+	}
+}
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+void invia_aggiornamento_info_sse(int indx, int rownr) {
+	if (eventity.count() == 0) return;
+
+    int8_t p_info = sistema_scs.elenco[indx].ptr_info;
+    if (p_info < 0 || p_info >= MAX_INFO) return;
+
+    const char *testo_riga = NULL;
+    switch (rownr) {
+        case 0: testo_riga = cardinfo[p_info].info_0; break;
+        case 1: testo_riga = cardinfo[p_info].info_1; break;
+        case 2: testo_riga = cardinfo[p_info].info_2; break;
+        case 3: testo_riga = cardinfo[p_info].info_3; break;
+        case 4: testo_riga = cardinfo[p_info].info_4; break;
+    }
+
+	char id[16];
+	snprintf(id, sizeof(id),"%s_INF", sistema_scs.elenco[indx].address);
+
+	char payload[64]; // Bastano pochi byte per una riga singola
+	snprintf(payload, sizeof(payload), "%d:%s", rownr, testo_riga);
+
+#ifdef DEBUG_EVENTITY
+    String rispostaLog = "[" + String(millis()/100) + "s] [CMD] ==UPD_CARD== : " + id + " -> " + payload;
+    events.send(rispostaLog.c_str(), "log", millis());
+#endif
+	if (eventity.count() != 0)
+		eventity.send(payload, id, millis());
+}
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+uint8_t scs_tratta_messaggi_dispositivi_ignoti(uint8_t addr_num, uint8_t des, uint8_t cmd, uint8_t arg)
+{
+/*
+
+// Struttura dati per il singolo elemento della lista con i limiti richiesti
+struct Elemento {
+    char address[3];     // 2 caratteri + terminatore null
+    char tipo[4];        // 3 caratteri + terminatore null
+    char descrizione[21];// 20 caratteri + terminatore null
+    char valore[4];      // 3 caratteri + terminatore null
+    bool valido = false; // Flag per verificare se lo slot è occupato    
+    AGG_VAL bits;        // in OR: 0x01=riga cancellata   0x02=riga nuova                0x10=chiave cambiata 
+                         //        0x20=tipo aggiornato   0x40=descrizione aggiornata    0x80=valore cambiato   
+};
+Elemento sistema_scs.elenco[MY_ENTITA];
+bool sistema_scs.tapparelle_percentuale = false; // Stato memorizzato in RAM
+// ----------------------------------------------------------------------------------------------------------------
+
+*/
+
+
+
+
+    uint8_t t = 0; // Tipo di dispositivo da censire (0 = non censito, 1 = luce, 2 = dimmer, 3 = tapparella, 4 = termostato)
+    if (cmd == 0x12) 
+	{ 
+        if ((arg == 0x00) || (arg == 0x01))
+			t = LUCE;
+		else
+		if ((arg & 0xF) == 0xD)
+			t = DIMMER;
+		else
+        if ((arg == 0x08) || (arg == 0x09) || (arg == 0x0A))
+			t = (sistema_scs.tapparelle_percentuale == true) ? TAPPARELLA_PCT : TAPPARELLA;
+	}
+	else
+	if ((cmd == 0x30) && ((des == 0xB4) || (des == 0xB5))) 
+			t = TERMOSTATO;
+
+
+	if (t != 0)
+	{
+// dispositivi ignoti - caricarli sulla "sistema_scs.elenco[]"
+
+		// --- AGGIUNGI NUOVO ELEMENTO IN RAM ---
+
+		int i = MY_ENTITA-1;
+        // Trova il primo slot vuoto
+        for(int ix = 0; ix < MY_ENTITA; ix++) 
+        {
+          if(sistema_scs.elenco[ix].valido == 0) 
+          {
+            i = ix;
+            sistema_scs.elenco[i].id = addr_num;
+            sistema_scs.elenco[i].bits.Val = 0;
+            sistema_scs.elenco[i].bits.nuova = 1;  // <-----------------------------------
+            break;
+          }
+        }
+
+		sprintf(sistema_scs.elenco[i].address, "%02X", addr_num);
+
+        sprintf(sistema_scs.elenco[i].descrizione, "dispositivo scs %02X", addr_num);  // device
+        sistema_scs.elenco[i].tipo_codice = t;
+
+//#ifdef TRACE_SSE
+        if (events.count() != 0) 
+        {
+	      char buflog[64];
+	      sprintf(buflog, "[TRC} == auto -> %02X, tipo %s", addr_num, codifica_codice_a_tipo(t));
+	      events.send(buflog, "log", millis());
+        }
+//#endif
+
+        set_device_default(i, 1);
+		if (t == TAPPARELLA_PCT)
+            strcpy(sistema_scs.elenco[i].valore_max, "100");
+        else
+            strcpy(sistema_scs.elenco[i].valore_max, "0");
+
+//	    rigenera_tabella_indice();
+
+        i = CercaAddress(addr_num);
+
+        return i;
+	}
+    else
+    {
+        if (events.count() != 0) 
+        {
+	      char buflog[64];
+          sprintf(buflog, "[TRC} == auto unknown -> %02X, to %02X : %02X %02X", addr_num, des, cmd, arg);
+	      events.send(buflog, "log", millis());
+        }
+    }
+    return 0xFF;
+}
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+void scs_tratta_messaggi_per_my_domotic_new(void)
+{
+    // ================================ C O M A N D I     S C S ===========================================
+
+    // SCS intero   [7] A8 32 00 12 01 21 A3
+    // SCS ridotto [0xF5] [y] 32 00 12 01
+    //  termostato [0xF5] [y] B4 01 30 F4
+
+#ifdef TRACE_SSE
+  char buflog[120];
+  sprintf(buflog, "[TRC} = domotic SSE %d  - cmd %02X %c", eventity.count(), replyBuffer[0], replyBuffer[1]);
+  events.send(buflog, "log", millis());
+#endif
+
+  bool modificato = false;
+
+  // ---------------------u-posizione tapparelle o dimmer %---------------------------------------------------------------------
+  if (replyBuffer[0] == 0xF3)    
+  { 
+    char device = replyBuffer[2];
+    int pct = replyBuffer[3];
+    if (replyBuffer[1] == 'u')    //'u': posizione tapparelle//
+    {
+    // ----------------uab-(address position)--- PUBBLICAZIONE STATO COVERPCT -------------------------------------------------------
+      int i = CercaAddress(device);
+      if (i != 0xFF) {
+        sprintf(sistema_scs.elenco[i].valore_corrente, "%d", pct);
+	    if (eventity.count() != 0)
+        {
+         char stato[32];
+         sprintf(stato, "%d|%s", pct, sistema_scs.elenco[i].stato);
+		 sse_ha_update(stato, sistema_scs.elenco[i].address);
+        }
+  	  }
+    }  
+	return;
+  }  
+
+
+//  if ((eventity.count() != 0) && (replyBuffer[1] == 'y') && ((replyBuffer[0] == 0xF5) || (replyBuffer[0] == 0xF6)))
+  if ((replyBuffer[1] == 'y') && ((replyBuffer[0] == 0xF5) || (replyBuffer[0] == 0xF6)))
+  { 
+    uint8_t des  = replyBuffer[2]; // Destinazione (es. 0x32, 0x91, 0xB4, 0xB5...)
+    uint8_t prov = replyBuffer[3]; // Provenienza / Zona (es. 0x01, 0x02...)
+    uint8_t cmd  = replyBuffer[4]; // Tipo di comando (es. 0x12 o 0x30)
+    uint8_t arg  = replyBuffer[5]; // Argomento reale (es. 0x00, 0x01, 0xF4...)
+
+	uint8_t addr_num = (des < prov) ? des : prov;  //04
+    if (addr_num == 0)
+        addr_num = (des < prov) ? prov : des;
+
+	uint8_t i = CercaAddress(addr_num); //ff
+
+//    if ((cmd == 0x30) && ((des == 0xB4) || (des == 0xB5))) 
+
+	if ((i == 0xFF ) && ((cmd == 0x30) || (cmd == 0x31) || (cmd == 0x32))) //ok
+	{
+		prov &= 0x0F;   //04
+		addr_num = prov; //04
+		i = CercaAddress(addr_num); //ff
+	}
+	else
+	if (des == 0xB1)
+	{
+		scs_tratta_messaggi_per_my_domotic_B1(des, cmd, arg);
+		return;
+	}
+#ifdef TRACE_SSE
+    if (events.count() != 0) 
+    {
+      char buflog[64];
+      sprintf(buflog, "[TRC} == auto? i: %02x -> %02X, to %02X : %02X %02X", i, addr_num, des, cmd, arg);
+      events.send(buflog, "log", millis());
+    }
+#endif
+// ------------------------------------------------------------------------------------
+	if ((i == 0xFF) && (autocensimento) && (addr_num != 0) && (addr_num < 0xB0))
+	{
+		i = scs_tratta_messaggi_dispositivi_ignoti(addr_num, des, cmd, arg); // 04 b5 30 1c
+	}
+	if (i == 0xFF) 
+		return;
+// ------------------------------------------------------------------------------------
+
+
+
+    uint8_t t = sistema_scs.elenco[i].tipo_codice;
+    int8_t  p_info = sistema_scs.elenco[i].ptr_info;
+            
+    char addr_cercato[3];
+    snprintf(addr_cercato, sizeof(addr_cercato), "%02X", addr_num);
+
+#ifdef TRACE_SSE
+	  char buflog[64];
+	  sprintf(buflog, "[TRC} == cmd %02X - des %02X - idx %d - tipo %d", cmd, des, i, t);
+	  events.send(buflog, "log", millis());
+#endif
+
+  // =================================================================
+    // 🟢 FLUSSO 1: AUTOMAZIONE LUCI E TAPPARELLE (CMD 0x12)
+    // =================================================================
+    if (cmd == 0x12)
+    {
+        // --- INTERPRETAZIONE AUTOMAZIONE LUCI / DIMMER ---
+        if (t == LUCE || t == DIMMER) { 
+            if (arg == 0x00) {
+                strcpy(sistema_scs.elenco[i].stato,"ON");
+                if (eventity.count() != 0)
+                {
+                    sse_ha_update(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address);
+                }
+            } else if (arg == 0x01) {
+                strcpy(sistema_scs.elenco[i].stato,"OFF");
+        		if (eventity.count() != 0)
+				{
+				    sse_ha_update(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address);
+				}
+            } else if (t == DIMMER && arg >= 0x1D && arg <= 0x9D) {
+                int step = ((arg >> 4) & 0x0F) - 1; 
+                int pct = step * 12;
+                if (pct > 100) pct = 100;
+                strcpy(sistema_scs.elenco[i].stato,"ON");
+                sprintf(sistema_scs.elenco[i].valore_corrente, "%d", pct);
+                if (eventity.count() != 0)
+                {
+                  char stato[32];
+                  sprintf(stato, "%s|%d", sistema_scs.elenco[i].stato, pct);
+                  sse_ha_update(stato, sistema_scs.elenco[i].address);
+                }
+        	}
+        }
+        // --- INTERPRETAZIONE TAPPARELLE ---
+        else if (t == TAPPARELLA || t == TAPPARELLA_PCT) 
+	    {
+          int target;
+          int corrente = atoi(sistema_scs.elenco[i].valore_corrente);
+          if (arg == 0x08) {
+              // Eseguiamo l'azione solo se non eravamo già in SALITA
+              if  (strcmp(sistema_scs.elenco[i].stato, "SALITA") != 0) 
+              {
+                  strcpy(sistema_scs.elenco[i].stato,"SALITA");
+                  if (eventity.count() != 0)
+                  {
+                     sse_ha_update(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address);
+                  }
+              }
+              target = 100;
+        } else if (arg == 0x09) {
+            // Eseguiamo l'azione solo se non eravamo già in DISCESA
+              if  (strcmp(sistema_scs.elenco[i].stato, "DISCESA") != 0) 
+              {
+                  strcpy(sistema_scs.elenco[i].stato,"DISCESA");
+                  if (eventity.count() != 0)
+                  {
+                    sse_ha_update(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address);
+                  }
+               }
+               target = 0;
+        } else if (arg == 0x0A) {
+            // 🟢 FILTRO IDEMPOTENZA (STOP LOOP): 
+            // Se lo stato è già "STOP" (perché impostato precedentemente a fine corsa),
+            // ignoriamo l'eco del comando 0x0A. 'modificato' rimarrà false e il blocco non verrà rieseguito!
+            if  (strcmp(sistema_scs.elenco[i].stato, "STOP") != 0) 
+            {
+                strcpy(sistema_scs.elenco[i].stato,"STOP");
+                if (eventity.count() != 0)
+                {
+                  if (t == TAPPARELLA_PCT)
+                  {
+                      char stato[32];
+                      sprintf(stato, "%s|%s", sistema_scs.elenco[i].valore_corrente, sistema_scs.elenco[i].stato);
+                      sse_ha_update(stato, sistema_scs.elenco[i].address);
+                  }
+                  else
+                      sse_ha_update(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address);
+                }
+            }
+            target = corrente;
+		 }
+       }
+	}
+	// =================================================================
+	// 🟢 FLUSSO 2: TERMOREGOLAZIONE (CMD 0x30)
+	// =================================================================
+	else if (cmd == 0x30) 
+	{
+#ifdef TRACE_SSE
+	  char buflog[64];
+	  sprintf(buflog, "[TRC} == TT cmd %02X - des %02X - idx %d - tipo %d", cmd, des, i, t);
+	  events.send(buflog, "log", millis());
+#endif
+		if (t == TERMOSTATO)  
+		{
+			// 🌡️ Risposta Temperatura <= 25.5°C
+			if (des == 0xB4) {
+				double temp = (double)arg / 10.0;
+				char nuova_temp_str[8];
+				snprintf(nuova_temp_str, sizeof(nuova_temp_str), "%.1f", temp);
+				if (strcmp(sistema_scs.elenco[i].stato,nuova_temp_str) != 0) {
+					strcpy(sistema_scs.elenco[i].stato,nuova_temp_str);
+					if (eventity.count() != 0)
+					{
+					   sse_ha_update(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address);
+					}
+				}
+			}
+			// 🌡️ Risposta Temperatura > 25.5°C
+			else if (des == 0xB5) 
+			{
+				double temp = 25.5 + ((double)arg / 10.0);
+				char nuova_temp_str[8];
+				snprintf(nuova_temp_str, sizeof(nuova_temp_str), "%.1f", temp);
+				if (strcmp(sistema_scs.elenco[i].stato,nuova_temp_str) != 0) {
+					strcpy(sistema_scs.elenco[i].stato,nuova_temp_str);
+					if (eventity.count() != 0)
+					{
+					   sse_ha_update(sistema_scs.elenco[i].stato, sistema_scs.elenco[i].address);
+					}
+				}
+			}
+			else
+			{
+				if (p_info == -1)  
+				{
+					if ((numeroInfo < MAX_INFO) && (cardinfo[numeroInfo].id < 0)) 
+					{
+						cardinfo[numeroInfo].id = i;
+						sistema_scs.elenco[i].ptr_info = numeroInfo;
+						p_info = numeroInfo;
+						invia_nuova_card_info_sse(i);
+						numeroInfo++;
+					}
+				}
+				if ((des == 0x90) || (des == 0x91)) // setup temperatura --estate/inverno---- 90/91 0z 30 tt  (x5)
+				{
+					double temp = ((double)arg /2.0);
+#ifdef INFO_LABEL
+					snprintf(cardinfo[p_info].info_0, INFO_LEN, "setup %.1f °C", temp);
+#else
+					snprintf(cardinfo[p_info].info_0, INFO_LEN, "%.1f °C", temp);
+#endif
+					invia_aggiornamento_info_sse(i, 0);
+				}
+				else
+				if (des == 0xB7)  // stato sonda ------ B7 zz 30 Fx
+				{
+					switch (arg)
+					{
+		// es. device	04 : zona 4	stato sonda    f0	(riscaldamento)	f1	(condizionamento)	f2	(antigelo)	f3	(protezione termica)	ff	(off)
+					case 0xf0:
+						snprintf(cardinfo[p_info].info_1, INFO_LEN, "riscaldamento");
+						modificato = true;
+						break;
+					case 0xf1:
+						snprintf(cardinfo[p_info].info_1, INFO_LEN,"condizionamento");
+						modificato = true;
+						break;
+					case 0xf2:
+						snprintf(cardinfo[p_info].info_1, INFO_LEN, "antigelo");
+						modificato = true;
+						break;
+					case 0xf3:
+						snprintf(cardinfo[p_info].info_1, INFO_LEN, "protezione");
+						modificato = true;
+						break;
+					case 0xff:
+						snprintf(cardinfo[p_info].info_1, INFO_LEN, "OFF");
+						modificato = true;
+						break;
+					}
+					if (modificato)
+					{
+						invia_aggiornamento_info_sse(i, 1);
+						modificato = false;
+					}
+				}
+			}
+		}
+	}
+
+
+	else if ((cmd == 0x31) && (des == 0xB7) && (t == TERMOSTATO))
+	{
+		if (p_info == -1) 
+		{
+				if ((numeroInfo < MAX_INFO) && (cardinfo[numeroInfo].id < 0)) 
+				{
+					cardinfo[numeroInfo].id = i;
+					sistema_scs.elenco[i].ptr_info = numeroInfo;
+					p_info = numeroInfo;
+					invia_nuova_card_info_sse(i);
+					numeroInfo++;
+				}
+		}
+		switch (arg)
+		{
+		  // stato attuatore --inverno---- B7 8z 31 0x
+		case 0x00:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "att. inverno ON");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "inverno ON");
+#endif
+			modificato = true;
+			break;
+		case 0x01:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "att. inverno OFF");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "inverno OFF");
+#endif
+			modificato = true;
+			break;
+		}
+		if (modificato)
+		{
+			invia_aggiornamento_info_sse(i, 2);
+			modificato = false;
+		}
+		switch (arg)
+		{
+		  // stato fancoil   --inverno---- B7 8z 31 2x
+		case 0x20:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil inv. OFF");
+#else
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "inverno OFF");
+#endif
+			modificato = true;
+			break;
+		case 0x21:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil inv. V 1");
+#else
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "inverno Vel. 1");
+#endif
+			modificato = true;
+			break;
+		case 0x22:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil inv. V 2");
+#else
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "inverno Vel. 2");
+#endif
+			modificato = true;
+			break;
+		case 0x23:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil inv. V 3");
+#else
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "inverno Vel. 3");
+#endif
+			modificato = true;
+			break;
+		default:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil OFF");
+#else
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "OFF");
+#endif
+			modificato = true;
+			break;
+		}
+		if (modificato)
+		{
+			invia_aggiornamento_info_sse(i, 3);
+			modificato = false;
+		}
+	}
+	else if ((cmd == 0x32) && (des == 0xB7) && (t == TERMOSTATO))
+	{
+		if (p_info == -1) 
+		{
+				if ((numeroInfo < MAX_INFO) && (cardinfo[numeroInfo].id < 0)) 
+				{
+					cardinfo[numeroInfo].id = i;
+					sistema_scs.elenco[i].ptr_info = numeroInfo;
+					p_info = numeroInfo;
+					invia_nuova_card_info_sse(i);
+					numeroInfo++;
+				}
+		}
+		switch (arg)
+		{
+		  // stato attuatore --estate---- B7 8z 32 0x
+		case 0x00:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "att. estate ON");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "estate ON");
+#endif
+			modificato = true;
+			break;
+		case 0x01:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "att. estate OFF");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "estate OFF");
+#endif
+			modificato = true;
+			break;
+		}
+		if (modificato)
+		{
+			invia_aggiornamento_info_sse(i, 2);
+			modificato = false;
+		}
+		switch (arg)
+		{
+		  // stato fancoil   --estate---- B7 8z 32 2x
+		case 0x20:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil est. OFF");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "estate OFF");
+#endif
+			modificato = true;
+			break;
+		case 0x21:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil est. V 1");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "estate Vel. 1");
+#endif
+			modificato = true;
+			break;
+		case 0x22:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil est. V 2");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "estate Vel. 2");
+#endif
+			modificato = true;
+			break;
+		case 0x23:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil est. V 3");
+#else
+			snprintf(cardinfo[p_info].info_2, INFO_LEN, "estate Vel. 3");
+#endif
+			modificato = true;
+			break;
+		default:
+#ifdef INFO_LABEL
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "fancoil OFF");
+#else
+			snprintf(cardinfo[p_info].info_3, INFO_LEN, "OFF");
+#endif
+			modificato = true;
+			break;
+		}
+		if (modificato)
+		{
+			invia_aggiornamento_info_sse(i, 3);
+			modificato = false;
+		}
+	}
+ } // <-replyBuffer[4] == 0x12---------------------comando----------------------------
+  // ----------------------------------------------------------------------------------------------------
+
+
+/* dispositivi generici non trattati per ora
+
+  else
+      
+  // ----------------------------------pubblicazione stati GENERIC device SCS (to & from)------------------------
+      { // generic device
+
+          device = replyBuffer[2];            // TO
+          devx = ixOfDevice(device);
+          
+          if ((devx) && (device_BUS_id[devx].deviceType == 11))  
+          {	          // device generic censito
+            char nomeDevice[3];
+            sprintf(nomeDevice, "%02X", device);  // to
+            topic = GENERIC_TO;
+            topic += nomeDevice;
+            const char* cTopic = topic.c_str();
+            char cPayload[8];
+          
+          
+            sprintf(cPayload, "%02X%02X%02X", replyBuffer[3], replyBuffer[4], replyBuffer[5]);
+            client.publish(cTopic, cPayload, mqtt_persistence);
+          }
+
+          device = replyBuffer[3];            // FROM
+          devx = ixOfDevice(device);
+          if ((devx) && (device_BUS_id[devx].deviceType == 11))  
+          {	          // device generic censito
+            char nomeDevice[3];
+            sprintf(nomeDevice, "%02X", device);  // from
+            topic = GENERIC_FROM;
+            topic += nomeDevice;
+            const char* cTopic = topic.c_str();
+            char cPayload[24];
+            sprintf(cPayload, "%02X%02X%02X", replyBuffer[2], replyBuffer[4], replyBuffer[5]);
+            client.publish(cTopic, cPayload, mqtt_persistence);
+          }
+
+      } // generic device
+       */
+
+  // ----------------------------------------------------------------------------------------------------
+}
+
+
+
+
+
+
+
+
+
+
+#endif
 
 
 
@@ -6460,40 +6592,34 @@ void loop() {
     if (countRestart == 0)  ESP.restart();
   }
 
-//  delay(100);
-//  return;
-  
-
-if (sm_picprog == PICPROG_FREE)
-{
+if (sm_picprog == PICPROG_FREE) {
 // ========================================== NORMAL RUN ====================================================
 
-#ifdef MY_DOMOTIC
-    if (flagRefreshDevices == 1)
-    {
-        events.send("Entità ricaricate - fai refresh pagina /sseha ", "log", millis());
-//        reloadEntity(0);
-        delay(5);
-    }
-#endif
 #ifdef MY_TABELLA
     if (flagRefreshDevices == 1)
     {
-        events.send("Entità ricaricate - fai refresh pagina /devices ", "log", millis());
-        reloadDevices();
+        if (events.count() != 0) 
+            events.send("Entità ricaricate - fai refresh pagina /dispositivi ", "log", millis());
         delay(5);
     }
 #endif
     flagRefreshDevices =  0;
-
-
+    if (delay_internal)
+        delay_internal--;
+    if ((events.count() != 0) && (internal != prev_internal) && (delay_internal == 0)) //  && (replyBuffer[1] |= 0))
+	{
+		prev_internal = internal;
+		if (internal)
+			events.send("In funzione - modalità server - OK", "stato", millis());
+		else
+			events.send("In funzione - modalità TEST - OK", "stato", millis());
+	}
 
       // ==================================== TCP server ====================================================
 #ifdef USE_TCPSERVER
-  if (tcpopen)
-  {
-   if (tcpserver.hasClient())
-   {
+   if (tcpopen) {
+
+   if (tcpserver.hasClient()) {
     // client is connected
     if (!tcpclient || !tcpclient.connected())
     {
@@ -6553,9 +6679,17 @@ if (sm_picprog == PICPROG_FREE)
 // ------------------------------------------------------------------------------------------------------
     {
       String busid = tcpJarg(tcpBuffer,(char *) "\"device\""); // bus id
-      deviceX = ixOfDevice(&busid[0]);
-      device = device_BUS_id[deviceX].address;
-      devtype = device_BUS_id[deviceX].deviceType;
+      deviceX = CercaAddress(busid.c_str()); // pointer device reale o temporaneo
+      if (deviceX == 0xFF)
+      {
+          device  = atoi(busid.c_str());
+          devtype = LUCE;
+      }
+      else
+      {
+          device  = sistema_scs.elenco[deviceX].id;
+          devtype = sistema_scs.elenco[deviceX].tipo_codice;
+      }
       
       String sreq = tcpJarg(tcpBuffer,(char *) "\"request\""); // on-off-up-down-stop-nn%
       String scmd = tcpJarg(tcpBuffer,(char *) "\"command\""); // 0xnn
@@ -6582,15 +6716,13 @@ if (sm_picprog == PICPROG_FREE)
       if (busid != "")
       {
         busid += "  ";
-        deviceX = ixOfDeviceNew(&busid[0]);
-        device = device_BUS_id[deviceX].address;
-
-        if (deviceX)
+        deviceX = CercaAddressNew(busid.c_str()); // pointer device esistente o nuovo
+        if (deviceX != 0xFF)
         {
-          String alexadescr = tcpJarg(tcpBuffer,(char *) "\"descr\"");
-          alexadescr.toCharArray(AlexaDescr, 21);  
+          device  = sistema_scs.elenco[deviceX].id;
 
-          WriteDescrOfIx(AlexaDescr, deviceX);
+          String alexadescr = tcpJarg(tcpBuffer,(char *) "\"descr\"");
+          strcpy(sistema_scs.elenco[deviceX].descrizione, alexadescr.c_str());
         
           String stype = tcpJarg(tcpBuffer,(char *) "\"type\"");
           devtype = (char) stype.toInt();
@@ -6600,12 +6732,11 @@ if (sm_picprog == PICPROG_FREE)
 //          if ((devtype == 9) && (domotic_options == 0x03))
 //             devtype = 19;          
 */
-          device_BUS_id[deviceX].deviceType = devtype;
+          sistema_scs.elenco[deviceX].tipo_codice = devtype;
              
           if ((alexaParam == 'y' ) && (devtype < 18))		// w6 - alexa non ha bisogno dei types 18 19
           {
-            String edesc = descrOfIx(deviceX);
-            fauxmo.renameDevice(&edesc[0], &alexadescr[0]);
+///            fauxmo.renameDevice(&edesc[0], alexadescr.c_str());  <----- ???
           }
           
           if ((devtype == 9) || (devtype == 19))			// w6 - aggiorna tapparelle pct su pic
@@ -6613,6 +6744,7 @@ if (sm_picprog == PICPROG_FREE)
             String smaxpos = tcpJarg(tcpBuffer,(char *) "\"maxp\"");
             char *ch;
             maxp.Val = (int)strtoul(&smaxpos[0], &ch, 10);
+            strcpy(sistema_scs.elenco[deviceX].valore_max, smaxpos.c_str());
             requestBuffer[requestLen++] = PIC_REQ;
             requestBuffer[requestLen++] = 'U';
             requestBuffer[requestLen++] = '8';
@@ -6647,23 +6779,25 @@ if (sm_picprog == PICPROG_FREE)
         delay(300);
         immediateReceive('k');
         delay(100);
-        tapparellePercentuale = false;
+        sistema_scs.tapparelle_percentuale = false;
       }  // cover == "false"
       else
       if (cover == "true")
       {
-        tapparellePercentuale = true;
+        sistema_scs.tapparelle_percentuale = true;
       }  // cover == "false"
 
       String devclear = tcpJarg(tcpBuffer,(char *) "\"devclear\"");
       if (devclear == "true")
       {
-        for (int i = 0; i < DEV_NR; ++i)
+/*
+        for (int i = 0; i < MY_ENTITA; ++i)
         {
           EEPROM.write((int) i * E_ALEXA_DESC_LEN + E_ALEXA_DESC_DEVICE, 0);
   	      device_BUS_id[i].Val = 0;
         }
-        WriteEEP((char) 0, (int) E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
+        WriteEEP((char) 0, (int) E_MQTT_TABDEVICES, (int) MY_ENTITA * E_MQTT_TABLEN);
+*/
       }  // devclear == "true"
       
 
@@ -6672,7 +6806,6 @@ if (sm_picprog == PICPROG_FREE)
       while (tcpBuffer[buflen]) buflen++;
       tcpclient.write(tcpBuffer, buflen);
       
-      WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
 //    EEPROM.commit();
       tcpclient.flush();
     }	// #putdevice
@@ -6682,15 +6815,13 @@ if (sm_picprog == PICPROG_FREE)
 // ------------------------------------------------------------------------------------------------------
     {
       deviceX = 1;
-      tapparellePercentuale = false;
-      while (device_BUS_id[deviceX].addressW)
+      sistema_scs.tapparelle_percentuale = false;
+      for (deviceX = 0; deviceX < MY_ENTITA; deviceX++)
       {
-        devtype = device_BUS_id[deviceX].deviceType;
-        if (device_BUS_id[deviceX].addressW)
+        if (sistema_scs.elenco[deviceX].valido == 1)
         {
-          device = DeviceOfIx(deviceX, nomeDevice);
-          String alexadescr = descrOfIx(deviceX);
-          alexadescr.toCharArray(AlexaDescr, 21);  
+          device = sistema_scs.elenco[deviceX].id;
+          devtype = sistema_scs.elenco[deviceX].tipo_codice;
           maxp.Val = 0;
           if ((devtype == 9) || (devtype == 19))
           {
@@ -6700,22 +6831,20 @@ if (sm_picprog == PICPROG_FREE)
             requestBuffer[requestLen++] = device;
             immediateSend();
             char m = immediateReceive('[');
-            tapparellePercentuale = true;
-            
+            sistema_scs.tapparelle_percentuale = true;
             if (m > 8)
             {
               maxp.Val = replyBuffer[2] | replyBuffer[1] << 8;
             }
-            
           }  // devtype == 9
-          sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",nomeDevice,devtype,maxp.Val,AlexaDescr);
+          sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",sistema_scs.elenco[deviceX].address,devtype,maxp.Val,sistema_scs.elenco[deviceX].descrizione);
           buflen = 0;
           while (tcpBuffer[buflen]) buflen++;
           tcpclient.write(tcpBuffer, buflen);
           tcpclient.flush();
-        } // devtype > 0
+        } // valido
         deviceX++;
-      } // while devicex < DEV_NR
+      } // for devicex < MY_ENTITA
      
       sprintf(tcpBuffer, "#eof");
       buflen = 0;
@@ -6733,30 +6862,36 @@ if (sm_picprog == PICPROG_FREE)
       String busid = tcpJarg(tcpBuffer,(char *) "\"device\"");
       if (busid != "")
       {
-//      deviceX = (char) busid.toInt();
-        deviceX = ixOfDevice(&busid[0]);
+        deviceX = CercaAddress(busid.c_str()); // pointer device reale o temporaneo
       }
       else
       busid = tcpJarg(tcpBuffer,(char *) "\"afterdev\"");
       if (busid != "")
       {
-//      deviceX = (char) busid.toInt();
-        deviceX = ixOfDevice(&busid[0]);
-        deviceX++;
+        deviceX = CercaAddress(busid.c_str()); // pointer device reale o temporaneo
+        if (deviceX != 0xFF)
+            deviceX++;
       }
       else
       busid = tcpJarg(tcpBuffer,(char *) "\"devnum\"");
       if (busid != "")
       {
         deviceX = (char) busid.toInt();
+        deviceX--;
       }
 
-      devtype = device_BUS_id[deviceX].deviceType;
-      if (device_BUS_id[deviceX].addressW)
+      if (deviceX == 0xFF)
       {
-          device = DeviceOfIx(deviceX, nomeDevice);
-          String alexadescr = descrOfIx(deviceX);
-          alexadescr.toCharArray(AlexaDescr, 21);  
+        sprintf(tcpBuffer, "#eof");
+        buflen = 0;
+        while (tcpBuffer[buflen]) buflen++;
+        tcpclient.write(tcpBuffer, buflen);
+        tcpclient.flush();
+      }
+      else
+      {         // testare valido
+          device = sistema_scs.elenco[deviceX].id;
+          devtype = sistema_scs.elenco[deviceX].tipo_codice;
           maxp.Val = 0;
           if ((devtype == 9) || (devtype == 19))
           {
@@ -6773,20 +6908,15 @@ if (sm_picprog == PICPROG_FREE)
             }
             
           }  // devtype == 9
-          sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",nomeDevice,devtype,maxp.Val,AlexaDescr);
+//          sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",nomeDevice,devtype,maxp.Val,AlexaDescr);
+          uint8_t devX = deviceX - 1; 
+          sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",sistema_scs.elenco[deviceX].address,devtype,maxp.Val,sistema_scs.elenco[deviceX].descrizione);
+//          sprintf(tcpBuffer, "{\"device\":\"%s\",\"type\":\"%d\",\"maxp\":\"%d\",\"descr\":\"%s\"}",sistema_scs.elenco[devX].address,devtype,maxp.Val,sistema_scs.elenco[devX].descrizione);
           buflen = 0;
           while (tcpBuffer[buflen]) buflen++;
           tcpclient.write(tcpBuffer, buflen);
           tcpclient.flush();
       } // devtype > 0
-      else
-      {
-        sprintf(tcpBuffer, "#eof");
-        buflen = 0;
-        while (tcpBuffer[buflen]) buflen++;
-        tcpclient.write(tcpBuffer, buflen);
-        tcpclient.flush();
-      }
     } // received "#getdevices"
     else
 // ------------------------------------------------------------------------------------------------------
@@ -6901,6 +7031,7 @@ if (sm_picprog == PICPROG_FREE)
         {
           ledCtr = 0;
           digitalWrite(pinLed, LOW); // acceso
+          gestisciPotenzaDinamica();
         }
       }
       else    // AP - 0.3sec
@@ -7078,9 +7209,9 @@ if (sm_picprog == PICPROG_FREE)
 
 
   replyLen = 0;
-  internal = 0;
   if (Serial1.available() )
   {
+    internal = 0;
     String log = "\r\ns2 rx: ";
     char logCh[4];
     char lmax;
@@ -7137,9 +7268,9 @@ if (sm_picprog == PICPROG_FREE)
   #endif
 #endif
         replyLen++;
-        delayMicroseconds(INNERWAIT);
+        delayMicroseconds(INNERWAIT); // 90
       }
-      delayMicroseconds(OUTERWAIT);
+      delayMicroseconds(OUTERWAIT); // 120
     }
     replyBuffer[replyLen] = 0;        // aggiunge 0x00
 
@@ -7159,76 +7290,76 @@ if (sm_picprog == PICPROG_FREE)
 
 
 
+
+
 // EVENTS SSE LOG
 
   if ((events.count() != 0) && (replyLen > 1)) //  && (replyBuffer[1] |= 0))
   {
+/*
+		if (internal != prev_internal)
+		{
+			prev_internal = internal;
+			if (internal)
+				events.send("In funzione - modalità server - OK", "stato", millis());
+			else
+				events.send("In funzione - modalità TEST - OK", "stato", millis());
+		}
+*/
       String log;
       char logCh[256];
       int xr = 0;
-      if (internal == 1)
+	  bool asc = false;
+      if (internal == 1) // modalita' interna - ok per tutto - caratteri in modalità interna [F3 ...
       {
 //        sprintf(logCh, "[%04d] SCS RX: {%02X %02X} -> ", (now/100), replyBuffer[xr++], replyBuffer[xr++]);
-        sprintf(logCh, "SCS RX: {%02X %02X} -> ", replyBuffer[xr++], replyBuffer[xr++]);
+        sprintf(logCh, "SCS RX (int): {%02X %02X} -> ", replyBuffer[xr++], replyBuffer[xr++]);
         log = logCh;
         while (xr < replyLen)
         {
           sprintf(logCh, "%02X ", replyBuffer[xr++]);
           log += logCh;
         }
-        events.send(log.c_str(), "log", millis());
+        if (events.count() != 0) 
+            events.send(log.c_str(), "log", millis());
       }
       else
-      {
-        log = "";
-//        sprintf(logCh, "[%04d] -> ", (now/100));
-//        log += logCh;
-        if ( replyBuffer[1] == '\n')
+      {				// modalità ascii oppure binaria
+//		log = "";
+        if ((replyBuffer[1] == '\r') || ( replyBuffer[1] == '\n'))
+		{
           log = &replyBuffer[2];
+		  asc = true;
+		}
         else
-        if ( replyBuffer[0] == '\r')
+        if ((replyBuffer[0] == '\r') || ( replyBuffer[0] == '\n'))
+		{
           log = &replyBuffer[1];
+		  asc = true;
+		}
         else
           log = replyBuffer;
-        
-//        log += replyBuffer;
-        log.replace("\r", ""); // Rimuove il Carriage Return
-        log.replace("\n", "\\n"); // Sostituisce il New Line con un a capo HTML
-        events.send(log.c_str(), "log", millis());
 
-        /*
-        char newLine = 0;
-        sprintf(logCh, "[%04d] --- RX: ", (now/100));
-        log += logCh;
+		if ((replyBuffer[1] >= 0x20) && (replyBuffer[1] <= 0x7E) || ((replyBuffer[1] == '\n') || (replyBuffer[1] == '\r')))  // CARATTERI NON STAMPABILI - modo binario
+			asc = true;
 
-        while (xr < replyLen)
-        {
-          if (replyBuffer[xr++] == 0x0d)
-          {
-            newLine = 1;
-            if (replyBuffer[xr] == 0x0a)
-                xr++;
-          }
-
-          if (newLine == 1)
-          {
-            events.send(log.c_str(), "log", millis());
-            sprintf(logCh, "[%04d] ------: ", (now/100));
-            log = logCh;
-          }
-          newLine = 2;
-          sprintf(logCh, "%c", replyBuffer[xr++]);
-          log += logCh;
-//          logCh[0] = replyBuffer[xr++];
-//          logCh[1] = 0;
-//          log += logCh;
-        }
-
-        if (newLine == 2)
-        {
-          events.send(log.c_str(), "log", millis());
-        }
-        */
+		if (!asc)  // CARATTERI NON STAMPABILI - modo binario
+		{
+			sprintf(logCh, "SCS rx (ext): -> {%02x} ", replyBuffer[xr++]);
+			log = logCh;
+			while (xr < replyLen)
+			{
+			  sprintf(logCh, "%02X ", replyBuffer[xr++]);
+			  log += logCh;
+			}
+		}
+		else
+		{
+	        log.replace("\r", ""); // Rimuove il Carriage Return
+		    log.replace("\n", "\\n"); // Sostituisce il New Line con un a capo HTML
+		}
+        if (events.count() != 0) 
+        	events.send(log.c_str(), "log", millis());
       }
   }
 
@@ -7309,132 +7440,29 @@ if (sm_picprog == PICPROG_FREE)
   // --------------------- FINE RISPOSTA HTTP -------------------------------------------
 
 
-
-
-
-  // --------------------- RISPOSTA HTTP di prova -------------------------------------------
-
-
-  if ((httpResp == "W") && (httpCallback[0] != 0))
-  {
-    if ((replyBuffer[0] == 0xF5) && (replyBuffer[1] == 'y') && (replyLen == 6))   // solo se stringa=   [0xF5] [y] 32 00 12 01
-    {
-      content = "http://";
-//      content += tcp_remote_ip.toString();
-      content += httpCallback;
-      char hBuffer[12];
-
-      // intero  [7] A8 32 00 12 01 21 A3
-      // ridotto [0xF5] [y] 32 00 12 01
-      // ----------------1---2--3--4--5--
-      sprintf(hBuffer, "&type=%02X", replyBuffer[4]);
-      content += hBuffer;
-      sprintf(hBuffer, "&from=%02X", replyBuffer[3]);
-      content += hBuffer;
-      sprintf(hBuffer, "&to=%02X", replyBuffer[2]);
-      content += hBuffer;
-      sprintf(hBuffer, "&cmd=%02X", replyBuffer[5]);
-      content += hBuffer;
-      httpClient.begin(content);
-      int httpCode = httpClient.GET();                                  //Send the request
-      httpClient.end();   //Close connection
-      content = "";
-    }
-  } // httpResp == "W"
-  // --------------------- FINE RISPOSTA HTTP -------------------------------------------
-
-
-
-
-
-
-  // =========================================== M Q T T  PUBLISH=================================================
-
-  // ------------[0xF3] [D] <index/device> <type> ----------------------- CENSIMENTO DEVICES -------------
-  if ((replyLen == 4) && (devIx > 0) && (replyBuffer[0] == 0xF3) && (replyBuffer[1] == DEVICEREQUEST)) // started from handleMqttDevices
-  {
-    devIx   = replyBuffer[2];
-    char device = replyBuffer[2];
-    char devtype = replyBuffer[3];
-#ifdef SCS_XX
-  // ------------[0xF4] [D] <index> <device> <type> ----------------------- CENSIMENTO DEVICES -------------
-  if ((replyLen == 5) && (devIx > 0) && (replyBuffer[0] == 0xF4) && (replyBuffer[1] == DEVICEREQUEST)) // started from handleMqttDevices
-  {
-    devIx   = replyBuffer[2];
-    char device = replyBuffer[3];
-    char devtype = replyBuffer[4];
-#endif
-    if ((devtype == 0xFF))  // || ((devCall > 1) && (devIx < devCall)))
-    {
-      WriteEEP((char*)&device_BUS_id[0], E_MQTT_TABDEVICES, (int) DEV_NR * E_MQTT_TABLEN);
-      EEPROM.commit();
-      if (firstTime == 0) setFirst();  // DEVONO essere attivi @MX  e §l
-      devIx = 0;
-      uartSemaphor = 1;
-      requestBuffer[requestLen++] = PIC_REQ;
-      requestBuffer[requestLen++] = 'U';
-      requestBuffer[requestLen++] = '7'; // chiede di ripubblicare tutte le posizioni
-      uartSemaphor = 0;
-    }
-    else if (devIx == 0)
-    {
-      device_BUS_id[devIx].Val = 0;
-      devIx++;
-      uartSemaphor = 1;
-      requestBuffer[requestLen++] = PIC_REQ;
-      requestBuffer[requestLen++] = DEVICEREQUEST;
-      requestBuffer[requestLen++] = devIx;
-      uartSemaphor = 0;
-    }
-    else
-    {
-      char dvx = ixOfDeviceNew(device);
-      MQTTnewdevice(dvx, 0);
-      devCtr++;
-      device_BUS_id[dvx].deviceType = devtype;
-      String dsc = descrOfIx(dvx);
-
-      if ((dsc[0] == 0) || (dsc[0] == 0xFF) || (dsc == ""))
-      {
-        // descrizione standard per ALEXA 
-        char AlexaDescr[E_ALEXA_DESC_LEN];
-        sprintf(AlexaDescr, "dispositivo scs %02X", devIx);  // device
-        WriteDescrOfIx(AlexaDescr, devIx);
-      }
-
-      devIx++;
-      uartSemaphor = 1;
-      requestBuffer[requestLen++] = PIC_REQ;
-      requestBuffer[requestLen++] = DEVICEREQUEST;
-      requestBuffer[requestLen++] = devIx;
-      uartSemaphor = 0;
-    }
-  } //  replyLen == 4...   fine censimento
-
-  // ----------------------------------------- FINE CENSIMENTO DEVICES -------------------------------------------------------
   else
-
-
-
-
 
   // ----------------------------------------- ALEXA STATO DEVICES ---------------------------------------------------------
     
 
+
   // ---------------------u-posizione tapparelle o dimmer %---------------------------------------------------------------------
   //    [F3] u <address> <position%>
-  if ((replyLen == 4) && (replyBuffer[0] == 0xF3))    
+  if ((replyLen == 4) && (replyBuffer[0] == 0xF3) && (replyBuffer[1] == 'u') &&  (alexaParam == 'y'))  //'u': posizione tapparelle//
   { // replyLen==4 && replyBuffer == 0xF3 'u'
-    char device = replyBuffer[2];
+    uint8_t device = replyBuffer[2];
     int pct = replyBuffer[3];
-    char devx = ixOfDevice(device);
+    uint8_t devx = CercaAddress(device);
    
-    
-    if (replyBuffer[1] == 'u')    //'u': posizione tapparelle//
+#ifdef TRACE_SSE
+  char buflog[120];
+  sprintf(buflog, "[TRC} alexa tapparelle ", replyBuffer[1]);
+  events.send(buflog, "log", millis());
+#endif
+    if (devx != 0xFF)
     {
-      if (alexaParam == 'y')      //u//
-      { // aggiornamento posizione coverpct fauxmo   
-        char id_alexa = device_BUS_id[devx].alexa_id;
+       // aggiornamento posizione coverpct fauxmo   
+        uint8_t id_alexa = sistema_scs.elenco[devx].alexa_id;
         if (id_alexa)
         {
           pct *= 255;
@@ -7442,371 +7470,9 @@ if (sm_picprog == PICPROG_FREE)
           if (pct == 0)  pct = 1;
           if (pct > 255) pct = 255;
           fauxmo.setState(id_alexa, 0xFF, pct);
-        }
-      } // alexaParam == 'y'
-    
-#ifdef NO_ALEXA_MQTT
-    else
-#endif    
-
-    // ----------------------------------------- ALEXA STATO DEVICES END----------------------------------------------------
-
-
-
-    // ----------------uab-(address position)--- PUBBLICAZIONE STATO COVERPCT -------------------------------------------------------
-      if (mqttopen == 3)    //u//
-      { // pubblicazione posizione coverpct   
-        char actionc[6];
-
-        sprintf(actionc, "%03u", pct);     // position
-        char nomeDevice[5];
-        sprintf(nomeDevice, "%02X", device);  // device
-        String topic = COVERPCT_STATE;
-        topic += nomeDevice;
-        const char* cTopic = topic.c_str();
-        client.publish(cTopic, actionc, mqtt_persistence);
-      } // mqttopen == 3
-    }  // 'u'
-    
-    else
-    
-    
-    if (replyBuffer[1] == 'm')    //'m': posizione dimmer//
-    {
-    // ----------------uab-(address position)--- PUBBLICAZIONE STATO DIMMER -------------------------------------------------------
-      if (mqttopen == 3)    //u//
-      { // pubblicazione posizione dimmer   [0xF3] [m] 32 00
-        char actionc[6];
-
-        sprintf(actionc, "%03u", pct);     // position
-        char nomeDevice[5];
-        sprintf(nomeDevice, "%02X", device);  // device
-        String topic = BRIGHT_STATE;
-        topic += nomeDevice;
-        const char* cTopic = topic.c_str();
-        client.publish(cTopic, actionc, mqtt_persistence);
-      } // mqttopen == 3
-    }    
-    
-    replyLen = 0; // per impedire pubblicazione UDP
-  } // replyLen==4 - 5  && replyBuffer == 0xF3-F4
-    
-  else
-
-
-
-
-  // --------SCS-----4abcd-(from-to-type-cmd)------- PUBBLICAZIONE STATO DEVICES -------------------------------------------------------
-  // --------KNX-----4abcd-(from-to-cmd)------------ PUBBLICAZIONE STATO DEVICES -------------------------------------------------------
-
-  if ((mqttopen == 3) && (replyBuffer[1] == 'y') && ((replyBuffer[0] == 0xF5) || (replyBuffer[0] == 0xF6)))
-  { // START pubblicazione stato device        [0xF5] [y] 32 00 12 01
-    char devtype;
-    char action;
-    String topic = "NOTOPIC";
-    String payload = "";
-
-    // ================================ C O M A N D I     S C S ===========================================
-
-    // SCS intero   [7] A8 32 00 12 01 21 A3
-    // SCS ridotto [0xF5] [y] 32 00 12 01
-    //  termostato [0xF5] [y] B4 01 30 F4      @yb46530f4  SENSORE
-
-    char devx = 0;
-    char device;
-    if ((replyBuffer[4] == 0x30) && ((replyBuffer[2] == 0xB4) || (replyBuffer[2] == 0xB5)))  // <-termostato----------------------------
-    {
-        device = replyBuffer[3];  
-        devtype = 15;
-
-        const char* cPayload;
-        const char* cTopic;
-        char nomeDevice[5];
-        sprintf(nomeDevice, "%02X", device);  // to
-        topic = SENSOR_TEMP_STATE;
-        topic += nomeDevice;
-
-        char actionc[5];
-        if (replyBuffer[2] == 0xB5)
-          sprintf(actionc, "%03u", (255 + replyBuffer[5])); 
-        else
-          sprintf(actionc, "%03u", replyBuffer[5]); 
-        actionc[4]=0;
-        actionc[3]= actionc[2];
-        actionc[2]=',';
-        payload = String(actionc);
-        
-        cPayload = payload.c_str();
-        cTopic = topic.c_str();
-        client.publish(cTopic, cPayload, mqtt_persistence);
+	    }    
     }
-    else
-    if (replyBuffer[4] == 0x12)  // <-comando----------------------------
-    {
-      action = replyBuffer[5];
-      if (replyBuffer[2] == 0xB1)   // <------------ indirizzato a TUTTI i devices
-      {
-        char nomeDevice[4];
-        String topicPfx;
-        const char* cPayload;
-        const char* cTopic;
-        char typeAll = 99;
-        switch (action)
-        {
-          case 0:
-            typeAll = 1;
-            payload = "ON";
-            topicPfx = SWITCH_STATE;
-            break;
-          case 1:
-            typeAll = 1;
-            payload = "OFF";
-            topicPfx = SWITCH_STATE;
-            break;
-          case 8:
-            typeAll = 8;
-            if ((domoticMode == 'h') || (domoticMode == 'H'))
-                payload = "open";
-            else
-                payload = "OFF";
-            topicPfx = COVER_STATE;
-            break;
-          case 9:
-            typeAll = 8;
-            if ((domoticMode == 'h') || (domoticMode == 'H'))
-                payload = "closed";
-            else
-                payload = "ON";
-            topicPfx = COVER_STATE;
-            break;
-          case 0x0A:
-            typeAll = 8;
-            payload = "STOP";
-            topicPfx = COVER_STATE;
-            break;
-        }
-        devx = 1;
-        while ((devx < DEV_NR) && (device_BUS_id[devx].addressW))
-        {
-          devtype = device_BUS_id[devx].deviceType;
-          if (((typeAll == 1) && (devtype == 3))  // dimmer
-            || (typeAll == devtype))  // switch - cover
-          {
-            sprintf(nomeDevice, "%02X", device_BUS_id[devx].address);  // to
-            topic = topicPfx;
-            topic += nomeDevice;
-            
-#ifdef USE_TCPSERVER
-            if ((tcpuart == 2) && (tcpclient) && (tcpclient.connected())) 
-            {
-              String log = "\r\npub: ";
-              log += topic;
-              log += " ";
-              log += payload;
-              tcpclient.write((char*)&log[0], log.length());
-              tcpclient.flush(); 
-            }
-//          else
-#endif
-            {
-              cPayload = payload.c_str();
-              cTopic = topic.c_str();
-              client.publish(cTopic, cPayload, mqtt_persistence);
-            }
-          }
-          devx++;
-        }
-        device = 0;
-        devtype = 0;
-      }                            // <------------ indirizzato a TUTTI i devices
-      else
-      {
-        if (replyBuffer[2] < 0xB0)
-          device = replyBuffer[2];  // to
-        else
-          device = replyBuffer[3];  // from
-      }
-
-
-
-      if ((action == 0) || (action == 1))       // switch
-        devtype = 1;
-      else if ((action == 3) || (action == 4))      // dimmer
-        devtype = 0; // sono solo richieste di +/- , poi arrivera' l'intensita'
-      else if ((action == 0x08) || (action == 0x09) || (action == 0x0A))   // cover
-        devtype = 8;
-      else if ((action & 0x0F) == 0x0D) // da 0x1D a 0x9D
-      {
-        devtype = 3;
-        action >>= 4;
-        action *= 10;	// percentuale 10-90
-
-        // --------------- percentuale da 1 a 255 (home assistant) ----------------
-        //         if (domoticMode == 'h')   // h=as homeassistant
-        {
-          int pct = action;
-          pct *= 255;      // da 0 a 25500
-          pct /= 100;      // da 0 a 100
-          action = (char) pct;
-        }
-      }
-      else
-        devtype = 0;
-
-
-
-
-
-      if ((device != 0) && (devtype != 0))
-      //      if ((device != 0) && (devtype != 0) && ((device != prevDevice) || (action != prevAction)))
-      { // device valido & evitare doppioni
-        prevDevice = device;
-        prevAction = action;
-
-        char nomeDevice[5];
-        sprintf(nomeDevice, "%02X", device);  // to
-
-      // ----------------------------------------- STATO SWITCH --------------------------------------------
-        if (devtype == 1)
-        {
-          if (action == 0)
-          {
-            payload = "ON";
-          }
-          else if (action == 1)
-          {
-            payload = "OFF";
-          }
-          topic = SWITCH_STATE;
-          topic += nomeDevice;
-        }
-        else
-        // ----------------------------------------- STATO DIMMER --------------------------------------------
-        if ((devtype == 3) ||(devtype == 4))
-        {
-          char actionc[4];
-          sprintf(actionc, "%02u", action);
-          payload = String(actionc);
-          topic = BRIGHT_STATE;
-          topic += nomeDevice;
-        }
-        else
-        // ----------------------------------------- STATO COVER --------------------------------------------
-        if ((devtype == 8) || (devtype == 18))
-        {
-          if (action == 0x08)
-          {
-            if ((domoticMode == 'h') || (domoticMode == 'H'))
-              payload = "open";
-            else
-              payload = "OFF";
-          }
-          else if (action == 0x09)
-          {
-            if ((domoticMode == 'h') || (domoticMode == 'H'))
-              payload = "closed";
-            else
-              payload = "ON";
-          }
-          else if (action == 0x0A)
-          {
-            payload = "STOP";
-          }
-
-          topic = COVER_STATE;
-          topic += nomeDevice;
-        } // devtype=8
-  // ----------------------------------------------------------------------------------------------------
-
-
-    // ======================================== P U B B L I C A Z I O N E ===========================================
-          const char* cTopic = topic.c_str();
-          
-          
-#ifdef USE_TCPSERVER
-          if ((tcpuart == 2) && (tcpclient) && (tcpclient.connected())) 
-          {
-            String log = "\r\npub: ";
-            log += topic;
-            log += " ";
-            log += payload;
-            tcpclient.write((char*)&log[0], log.length());
-            tcpclient.flush(); 
-          }
-#endif
-          
-          if (payload == "")
-          {
-              char cPayload[24];
-              sprintf(cPayload, "UNKNOWN: %02X %02X %02X %02X", replyBuffer[1], replyBuffer[2], replyBuffer[3], replyBuffer[4]);  // to
-              client.publish(cTopic, cPayload, 0);
-          }
-          else
-          {
-              const char* cPayload = payload.c_str();
-              client.publish(cTopic, cPayload, mqtt_persistence);
-          }
-      }       // evitare doppioni & device valido
-    } // <-replyBuffer[4] == 0x12---------------------comando----------------------------
-  // ----------------------------------------------------------------------------------------------------
-    else
-      
-      
-      
-  // ----------------------------------pubblicazione stati GENERIC device SCS (to & from)------------------------
-      { // generic device
-
-          device = replyBuffer[2];            // TO
-          devx = ixOfDevice(device);
-          
-          if ((devx) && (device_BUS_id[devx].deviceType == 11))  
-          {	          // device generic censito
-            char nomeDevice[3];
-            sprintf(nomeDevice, "%02X", device);  // to
-            topic = GENERIC_TO;
-            topic += nomeDevice;
-            const char* cTopic = topic.c_str();
-            char cPayload[8];
-          
-#ifdef USE_TCPSERVER
-            if ((tcpuart == 2) && (tcpclient) && (tcpclient.connected())) 
-            {
-              String log = "\r\npub: ";
-              log += topic;
-              log += " ";
-              log += payload;
-              tcpclient.write((char*)&log[0], log.length());
-              tcpclient.flush(); 
-            }
-#endif
-          
-            sprintf(cPayload, "%02X%02X%02X", replyBuffer[3], replyBuffer[4], replyBuffer[5]);
-            client.publish(cTopic, cPayload, mqtt_persistence);
-          }
-
-          device = replyBuffer[3];            // FROM
-          devx = ixOfDevice(device);
-          if ((devx) && (device_BUS_id[devx].deviceType == 11))  
-          {	          // device generic censito
-            char nomeDevice[3];
-            sprintf(nomeDevice, "%02X", device);  // from
-            topic = GENERIC_FROM;
-            topic += nomeDevice;
-            const char* cTopic = topic.c_str();
-            char cPayload[24];
-            sprintf(cPayload, "%02X%02X%02X", replyBuffer[2], replyBuffer[4], replyBuffer[5]);
-            client.publish(cTopic, cPayload, mqtt_persistence);
-          }
-
-      } // generic device
-  // ----------------------------------------------------------------------------------------------------
-    } // END pubblicazione stato devices
-
-  // ================================ F I N E   C O M A N D I     S C S ===========================================
-
-
-
-
+  }
 
 
 
@@ -7815,277 +7481,24 @@ if (sm_picprog == PICPROG_FREE)
 
 #ifdef MY_DOMOTIC
   // ================================== P U B B L I C A Z I O N E    S S E =========================================
+	if (replyLen > 1)
+		scs_tratta_messaggi_per_my_domotic_new();
+#endif
+  // ===============================================================================================================
 
-
-  // ---------------------u-posizione tapparelle o dimmer %---------------------------------------------------------------------
-  //    [F3] u <address> <position%>
-//  if ((eventity.count() != 0) && (replyLen == 4) && (replyBuffer[0] == 0xF3))    
-  if ((eventity.count() != 0) && (replyBuffer[0] == 0xF3))    
-  { // replyLen==4 && replyBuffer == 0xF3 'u'
-    char device = replyBuffer[2];
-    int pct = replyBuffer[3];
-   
-    if (replyBuffer[1] == 'u')    //'u': posizione tapparelle//
+    // ----------------------------------------- ALEXA STATO DEVICES END----------------------------------------------------
+	if ((replyLen > 1) && (mqttopen == 3) && (replyBuffer[1] != DEVICEREQUEST))
     {
-    // ----------------uab-(address position)--- PUBBLICAZIONE STATO COVERPCT -------------------------------------------------------
-      int i = cercaEntitaScs(device);
-
-      if (i>=0) {
-//        char actionc[6];
-//        sprintf(actionc, "%3u", pct);     // position
-//        elencoEntita[i].valore = atoi(actionc);
-        elencoEntita[i].valore = pct;
-        eventity.send(String(elencoEntita[i].valore) + "|" + elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-#ifdef DEBUG_EVENTITY
-        String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + payload;
-        events.send(rispostaLog.c_str(), "log", millis());
-#endif
-      }
-    }  // 'u'
-  }  
-
-/*
-    else
-    
-    if (replyBuffer[1] == 'm')    //'m': posizione dimmer//
-    {
-    // ----------------uab-(address position)--- PUBBLICAZIONE STATO DIMMER -------------------------------------------------------
-      if (mqttopen == 3)    //u//
-      { // pubblicazione posizione dimmer   [0xF3] [m] 32 00
-        char actionc[6];
-
-        sprintf(actionc, "%03u", pct);     // position
-        char nomeDevice[5];
-        sprintf(nomeDevice, "%02X", device);  // device
-        String topic = BRIGHT_STATE;
-        topic += nomeDevice;
-        const char* cTopic = topic.c_str();
-        client.publish(cTopic, actionc, mqtt_persistence);
-      } // mqttopen == 3
-    }    
-    
-    replyLen = 0; // per impedire pubblicazione UDP
-  } // replyLen==4 - 5  && replyBuffer == 0xF3-F4
-
-else
-
-*/
-
-
-
-  // --------SCS-----4abcd-(from-to-type-cmd)------- PUBBLICAZIONE STATO DEVICES -------------------------------------------------------
-  // --------KNX-----4abcd-(from-to-cmd)------------ PUBBLICAZIONE STATO DEVICES -------------------------------------------------------
-
-  if ((eventity.count() != 0) && (replyBuffer[1] == 'y') && ((replyBuffer[0] == 0xF5) || (replyBuffer[0] == 0xF6)))
-  { // START pubblicazione stato device        [0xF5] [y] 32 00 12 01
-    char devtype;
-    char action;
-    char actionc[16];
-    String payload = "";
-    char device;
-    int i;
-    int valore = -1;
-    // ================================ C O M A N D I     S C S ===========================================
-
-    // SCS intero   [7] A8 32 00 12 01 21 A3
-    // SCS ridotto [0xF5] [y] 32 00 12 01
-    //  termostato [0xF5] [y] B4 01 30 F4
-
-    if ((replyBuffer[4] == 0x30) && ((replyBuffer[2] == 0xB4) || (replyBuffer[2] == 0xB5)))  // <-termostato----------------------------
-    {
-      device = replyBuffer[3];  
-      devtype = 15;
-
-      if (replyBuffer[2] == 0xB5)
-        sprintf(actionc, "%03u", (255 + replyBuffer[5])); 
-      else
-        sprintf(actionc, "%03u", replyBuffer[5]); 
-      actionc[4]=0;
-      actionc[3]= actionc[2];
-      actionc[2]=',';
-      payload = String(actionc);
-      
-      i = cercaEntitaScs(device);
-
-      if (i>=0) {
-        elencoEntita[i].stato = payload;
-        eventity.send(elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-#ifdef DEBUG_EVENTITY
-    String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + payload;
-    events.send(rispostaLog.c_str(), "log", millis());
-#endif
-      }
-    }
-    else
-
-    // enum TipoEntita { ENTI_INTERRUTTORE, ENTI_SENSORE, ENTI_SLIDER, ENTI_TAPPARELLA };
-
-    if (replyBuffer[4] == 0x12)  // <-comando----------------------------
-    {
-      char typeAll = 0;
-      action = replyBuffer[5];
-      switch (action)
-      {
-        case 0:
-          typeAll = 1;
-          payload = "ON";
-          break;
-        case 1:
-          typeAll = 1;
-          payload = "OFF";
-          break;
-        case 8:
-          typeAll = 8;
-          payload = "SALITA";
-          break;
-        case 9:
-          typeAll = 8;
-          payload = "DISCESA";
-          break;
-        case 0x0A:
-          typeAll = 8;
-          payload = "STOP";
-          break;
-        default:
-          if ((action & 0x0F) == 0x0D) // da 0x1D a 0x9D
-          {
-            typeAll = 3;
-            action >>= 4;
-            action *= 10;	// percentuale 10-90
-            sprintf(actionc, "%02u", action);
-            valore = action;
-          }
-          break;
-      }
-
-
-
-      if (replyBuffer[2] == 0xB1)   // <------------ indirizzato a TUTTI i devices
-      {
-        for (int i = 0; i < numeroEntita; i++) 
-        {
-          if (((typeAll == 1)  // on/off
-                && (elencoEntita[i].tipo == ENTI_INTERRUTTORE))
-          ||  ((typeAll == 8)  // up/down/stop
-                && ((elencoEntita[i].tipo == ENTI_TAPPARELLA) || (elencoEntita[i].tipo == ENTI_TAPPARELLA_PCT))))
-          {                
-            elencoEntita[i].stato = payload;
-            eventity.send(elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-#ifdef DEBUG_EVENTITY
-  String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + payload;
-  events.send(rispostaLog.c_str(), "log", millis());
-#endif
-          }
-          else
-          if ((typeAll == 1)  // on/off
-                && (elencoEntita[i].tipo == ENTI_SLIDER))
-          {                
-            elencoEntita[i].stato = payload;
-            eventity.send(String(elencoEntita[i].stato.c_str()) + "|" + elencoEntita[i].valore, elencoEntita[i].id.c_str(), millis());
-#ifdef DEBUG_EVENTITY
-  String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + payload;
-  events.send(rispostaLog.c_str(), "log", millis());
-#endif
-          }
-        }
-      }                            
-      else
-      {                           // <------------ indirizzato a UN SOLO device
-        if (replyBuffer[2] < 0xB0)
-          device = replyBuffer[2];  // to
-        else
-          device = replyBuffer[3];  // from
-        i = cercaEntitaScs(device); 
-        if (i>=0) 
-        {
-          if (elencoEntita[i].tipo == ENTI_TAPPARELLA_PCT)
-          {
-            elencoEntita[i].stato = payload;
-            eventity.send(String(elencoEntita[i].valore) + "|" + elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-#ifdef DEBUG_EVENTITY
-  String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + payload + "|" + String(elencoEntita[i].valore);
-  events.send(rispostaLog.c_str(), "log", millis());
-#endif
-          }
-          else
-          if (elencoEntita[i].tipo == ENTI_SLIDER)
-          {
-            if (valore >= 0)
-                elencoEntita[i].valore = valore;
-            if (payload != "")
-                elencoEntita[i].stato = payload;
-            eventity.send(String(elencoEntita[i].stato.c_str()) + "|" + elencoEntita[i].valore, elencoEntita[i].id.c_str(), millis());
-#ifdef DEBUG_EVENTITY
-  String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + String(elencoEntita[i].valore) + "|" + elencoEntita[i].stato;
-  events.send(rispostaLog.c_str(), "log", millis());
-#endif
-          }
-          else
-          {
-            elencoEntita[i].stato = payload;
-            eventity.send(elencoEntita[i].stato.c_str(), elencoEntita[i].id.c_str(), millis());
-#ifdef DEBUG_EVENTITY
-  String rispostaLog = "[" + String(millis()/100) + "s] [CMD] id: " + elencoEntita[i].id + " : " + payload;
-  events.send(rispostaLog.c_str(), "log", millis());
-#endif
-          }
-        }
-      }
-    } // <-replyBuffer[4] == 0x12---------------------comando----------------------------
+		if (scs_tratta_messaggi_per_mqtt() == 0)
+			replyLen = 0; //  impedire pubblicazione UDP messaggi m e u
+	} // END pubblicazione stato devices
   // ----------------------------------------------------------------------------------------------------
-
-
-/* dispositivi generici non trattati per ora
-
-  else
-      
-  // ----------------------------------pubblicazione stati GENERIC device SCS (to & from)------------------------
-      { // generic device
-
-          device = replyBuffer[2];            // TO
-          devx = ixOfDevice(device);
-          
-          if ((devx) && (device_BUS_id[devx].deviceType == 11))  
-          {	          // device generic censito
-            char nomeDevice[3];
-            sprintf(nomeDevice, "%02X", device);  // to
-            topic = GENERIC_TO;
-            topic += nomeDevice;
-            const char* cTopic = topic.c_str();
-            char cPayload[8];
-          
-          
-            sprintf(cPayload, "%02X%02X%02X", replyBuffer[3], replyBuffer[4], replyBuffer[5]);
-            client.publish(cTopic, cPayload, mqtt_persistence);
-          }
-
-          device = replyBuffer[3];            // FROM
-          devx = ixOfDevice(device);
-          if ((devx) && (device_BUS_id[devx].deviceType == 11))  
-          {	          // device generic censito
-            char nomeDevice[3];
-            sprintf(nomeDevice, "%02X", device);  // from
-            topic = GENERIC_FROM;
-            topic += nomeDevice;
-            const char* cTopic = topic.c_str();
-            char cPayload[24];
-            sprintf(cPayload, "%02X%02X%02X", replyBuffer[2], replyBuffer[4], replyBuffer[5]);
-            client.publish(cTopic, cPayload, mqtt_persistence);
-          }
-
-      } // generic device
-       */
-
-  // ----------------------------------------------------------------------------------------------------
-    } // END pubblicazione stato devices
 
   // ================================ F I N E   C O M A N D I     S C S ===========================================
 
 
 
 
-#endif
-  // ===============================================================================================================
 
 
 
@@ -8115,7 +7528,7 @@ else
 
 
 
-      // ===================================CICLO SCRITTURA BUFFER UART=================================================
+      // ===================================CICLO SCRITTURA BUFFER UART=DA REQUESTBUFFER===LOGGATA======================
       if (requestLen > 0)
       {
         uartSemaphor = 1;
@@ -8226,7 +7639,8 @@ else
 //            log.replace("§", "&#xA7"); // § 0xA7
 //            log.replace("@", "&#x40"); // @ 0x40
 
-            events.send(log.c_str(), "log", millis());
+            if (events.count() != 0) 
+                events.send(log.c_str(), "log", millis());
         }
 
         requestLen = 0;
@@ -8248,6 +7662,16 @@ else
       }
       // ===============================================================================================================
 
+	  if (events.count() != prevcount)
+	  {
+		if ((events.count() == 0) && (prevcount)) // se ho chiuso tutte le sessioni aperte
+		{
+			setFirst();
+			internal = 1;
+		}
+		prevcount = events.count();
+	  }
+
 // =======================================end NORMAL RUN ====================================================
 }
 #ifdef FFS
@@ -8265,6 +7689,7 @@ else
       // =====================================================================================================
       // =====================================================================================================
 }
+
 // =====================================================================================================
 /*
 // =====================================================================================================
