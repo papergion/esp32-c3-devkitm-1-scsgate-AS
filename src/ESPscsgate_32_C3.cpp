@@ -210,8 +210,6 @@ wifi_power_t TxPower = WIFI_POWER_8_5dBm;
 uint8_t  ctrPotenza = 0;
 uint8_t  forcePower = 0;
 
-uint16_t delay_internal = 1000;
-
 // =======================================================================================================================
 // Struttura dati per il byte di aggiornamento
   typedef union _AGG_VAL
@@ -491,6 +489,9 @@ int  prevcount = 0;
 char prevAction;
 char internal;
 char prev_internal;
+uint16_t delay_internal = 1000;
+uint8_t logMode = 0;
+
 unsigned char devIx = 0;
 unsigned char devCtr = 0;
 char uartSemaphor = 0;
@@ -2774,6 +2775,18 @@ a_server.on("/api/config", HTTP_GET, [](AsyncWebServerRequest *request) {
                  result = 3;
               } // mqttopen
 			} // mqttnew
+			else
+            if (comandoRicevuto == "loghex")
+            {
+                events.send("hex log","log", millis());
+				logMode = 1;
+            }
+			else
+            if (comandoRicevuto == "log")
+            {
+                events.send("hex log off","log", millis());
+				logMode = 0;
+            }
 			else
             if ((comandoRicevuto == "internal") || (comandoRicevuto == "server"))
             {
@@ -7310,6 +7323,19 @@ if (sm_picprog == PICPROG_FREE) {
       char logCh[256];
       int xr = 0;
 	  bool asc = false;
+      if (logMode == 1) // modalita' HEX
+      {
+        sprintf(logCh, "(hex): {%02X} -> ", replyLen);
+        log = logCh;
+        while (xr < replyLen)
+        {
+          sprintf(logCh, "%02X ", replyBuffer[xr++]);
+          log += logCh;
+        }
+        if (events.count() != 0) 
+            events.send(log.c_str(), "log", millis());
+      }
+      else
       if (internal == 1) // modalita' interna - ok per tutto - caratteri in modalità interna [F3 ...
       {
 //        sprintf(logCh, "[%04d] SCS RX: {%02X %02X} -> ", (now/100), replyBuffer[xr++], replyBuffer[xr++]);
@@ -7325,26 +7351,19 @@ if (sm_picprog == PICPROG_FREE) {
       }
       else
       {				// modalità ascii oppure binaria
-//		log = "";
-        if ((replyBuffer[1] == '\r') || ( replyBuffer[1] == '\n'))
+        asc = true;
+		while (xr < replyLen)
 		{
-          log = &replyBuffer[2];
-		  asc = true;
-		}
+    		if (((replyBuffer[xr] >= 0x20) && (replyBuffer[xr] <= 0x7E)) || (replyBuffer[xr] == '\r') || (replyBuffer[xr] == '\n'))  // CARATTERI NON STAMPABILI - modo binario
+        {}
         else
-        if ((replyBuffer[0] == '\r') || ( replyBuffer[0] == '\n'))
-		{
-          log = &replyBuffer[1];
-		  asc = true;
+               asc = false;
+            xr++;
 		}
-        else
-          log = replyBuffer;
-
-		if ((replyBuffer[1] >= 0x20) && (replyBuffer[1] <= 0x7E) || ((replyBuffer[1] == '\n') || (replyBuffer[1] == '\r')))  // CARATTERI NON STAMPABILI - modo binario
-			asc = true;
 
 		if (!asc)  // CARATTERI NON STAMPABILI - modo binario
 		{
+            xr = 0;
 			sprintf(logCh, "SCS rx (ext): -> {%02x} ", replyBuffer[xr++]);
 			log = logCh;
 			while (xr < replyLen)
@@ -7355,7 +7374,18 @@ if (sm_picprog == PICPROG_FREE) {
 		}
 		else
 		{
-	        log.replace("\r", ""); // Rimuove il Carriage Return
+            if ((replyBuffer[1] == '\r') || ( replyBuffer[1] == '\n'))
+		    {
+              log = &replyBuffer[2];
+		    }
+            else
+            if ((replyBuffer[0] == '\r') || ( replyBuffer[0] == '\n'))
+		    {
+              log = &replyBuffer[1];
+		    }
+            else
+              log = replyBuffer;
+            log.replace("\r", ""); // Rimuove il Carriage Return
 		    log.replace("\n", "\\n"); // Sostituisce il New Line con un a capo HTML
 		}
         if (events.count() != 0) 
